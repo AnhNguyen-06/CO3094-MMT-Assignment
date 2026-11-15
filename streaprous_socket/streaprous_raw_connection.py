@@ -25,7 +25,8 @@ import sys
 import threading
 import time
 import queue
-from collections import namedtuple
+from collections import namedtuple, deque
+from dataclasses import dataclass
 import netifaces
 
 # Import streaprout packet dispatcher functions
@@ -74,7 +75,7 @@ DEFAULT_INTERFACE_NAME = "lo0"
 # ---------------------------------------------------------------------------
 # Reliability helpers
 # ---------------------------------------------------------------------------
-MSS = 1300 
+MSS = 1460
 M32 = 0xFFFFFFFF
 
 def seq_diff(a, b):
@@ -92,7 +93,7 @@ def classify_segment(rcv_nxt, seq, length):
     return "gap_or_overlap"         # there is a gap or overlap
 
 def split_into_segments(payload, mss=MSS):
-    return [payload[i:i + mss] for i in range(0, len(payload), mss)]
+    return [payload[offset:offset + mss] for offset in range(0, len(payload), mss)] # slide 77 chapter 3
 
 # --- RTT / RTO estimation and retransmission ---
 ALPHA = 0.125       # weight of the new sample in EstimatedRTT
@@ -110,14 +111,89 @@ class RttEstimator:
         self.rto = INITIAL_RTO
 
     def update(self, sample):
+        if sample <= 0:
+            return
         if self.est is None:                   # first sample
             self.est = sample
             self.dev = sample / 2
         else:
-            self.dev = (1 - BETA) * self.dev + BETA * abs(sample - self.est)
-            self.est = (1 - ALPHA) * self.est + ALPHA * sample
-        self.rto = min(max(self.est + 4 * self.dev, MIN_RTO), MAX_RTO)
+            self.dev = (1 - BETA) * self.dev + BETA * abs(sample - self.est)    # slide 83 chapter 3: DevRTT = (1-beta)*DevRTT + beta*abs(SampleRTT - EstimatedRTT).
+            self.est = (1 - ALPHA) * self.est + ALPHA * sample  # slide 82 chapter 3: # EstimatedRTT = (1-alpha)*EstimatedRTT + alpha*SampleRTT.
+        calculated_rto = self.est + 4 * self.dev    # Chapter 3, slide 3-83: TimeOutInterval = EstimatedRTT + 4*DevRTT.
+        self.rto = min(max(calculated_rto, MIN_RTO), MAX_RTO)
 
+@dataclass
+class OutstandingSegment:
+    # slides 79 và 146 chapter 3: lưu dữ liệu đã gửi, chờ cumulative ACK
+    seq: int
+    payload: bytes
+    first_sent_at: float
+    last_sent_at: float
+    retransmitted: bool = False
+
+# hàm mới cùng các biến đã thống nhất với sender
+def on_ack(conn, segment, received_at):
+    """xử lý dữ liệu ACK sau khi đã thiết lập handshake"""
+    ack_flag = bool(segment.flags & 0x10)
+    syn_or_rst = bool(segment.flags & 0x06)
+    if not ack_flag or syn_or_rst:
+        return "invalid"
+
+    ack = segment.ack
+    with conn.cv:
+        if conn.error is not None or seq_diff(ack, conn.server_seq) > 0: # ACK phải nằm trong giới hạn dữ liệu đã gửi
+            return "invalid"
+        progress = seq_diff(ack, conn.send_base)
+        if progress < 0:
+            return "old"
+        elif progress == 0:
+            pure_ack = (not segment.payload and not (segment.flags & 0x07)) # ko có SYN/RST/FIN
+            same_window = segment.window == conn.last_ack_window
+            if conn.unacked and pure_ack and same_window:
+                conn.dup_ack_count += 1
+                if conn.dup_ack_count == 3:
+                    conn.fast_retransmit_pending = True # slide 88 chapter 3: 3 duplicate ACK cần fast retransmit
+            else:
+                conn.dup_ack_count = 0
+            conn.last_ack_window = segment.window
+            conn.cv.notify_all()
+            return "duplicate"
+
+        # slide 79, 146 chapter 3: ACK mới xác nhận liên tục các byte trước ACK number
+        rtt_sample = None
+        ack_retransmission = False
+        while conn.unacked:
+            record = conn.unacked[0]
+            ack_bytes = seq_diff(ack, record.seq)
+            if ack_bytes <= 0:
+                break
+            if record.retransmitted: # đánh dấu để loại mẫu RTT
+                ack_retransmission = True
+            if ack_bytes >= len(record.payload):
+                conn.unacked.popleft() # record đã đủ nên cần giải phóng bớt dữ liệu đã ACK kể cả khi record từng được gửi lại
+                if not record.retransmitted:
+                    rtt_sample = received_at - record.first_sent_at
+            else:
+                record.payload = record.payload[ack_bytes:] # bỏ prefix đã ACK
+                record.seq = ack
+                break
+
+        conn.send_base = ack # slide 146 chapter 3: send_base = y
+        # slide 81 chapter 3: bỏ qua mẫu từ retransmission, chọn cách thận trọng: bỏ mẫu nếu ACK này cũng xác nhận dữ liệu đã từng được gửi lại
+        if rtt_sample is not None and not ack_retransmission:
+            conn.rtt.update(rtt_sample)
+        conn.dup_ack_count = 0
+        conn.retry_count = 0
+        conn.fast_retransmit_pending = False
+        conn.last_ack_window = segment.window
+        # slide 146 chapter 3: còn dữ liệu chưa ACK -> khởi động lại timer, ACK hết dữ liệu -> dừng timer
+        if conn.unacked:
+            conn.timer_deadline = received_at + conn.rtt.rto
+        else:
+            conn.timer_deadline = None
+
+        conn.cv.notify_all()
+        return "new"
 
 def register_keep_port_alive(listen_ip="0.0.0.0", listen_port=22239, retry_interval=10):
     """
@@ -839,99 +915,138 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq):
     """Wait for the client to ACK up to the last byte of the response, and retransmit lost segments.
 
     Returns (last_byte_acked, all_acked).
-    last_byte_acked = the LAST byte the client has acknowledged (slide 3-122) = ACK number - 1.
+    last_byte_acked = the LAST byte the client has acknowledged (slide 3-146) = SendBase - 1.
     `start` = first byte of the response, `target` = the byte right after the last byte.
     Retransmits the OLDEST unacknowledged segment when:
       - the RTO timer expires (RTO doubles after each expiry), or
       - exactly 3 consecutive duplicate ACKs arrive (fast retransmit).
     Gives up after MAX_RETRIES consecutive retransmissions without progress.
+
+    start: sequence bắt đầu của payload trong lần gửi
+    target: sequence ngay sau byte cuối của payload
+    unacked: là conn_info.unacked
+    rtt: là conn_info.rtt
+    trả về (last_byte_acked, all_acked)
     """
     last_byte_acked = (start - 1) & M32          # no byte acknowledged yet
     last_byte_sent = (target - 1) & M32          # last byte of the response
-    if seq_diff(start, target) >= 0:             # nothing to wait for
-        return last_byte_acked, True
+    # if seq_diff(start, target) >= 0:             # nothing to wait for
+    #     return last_byte_acked, True
 
-    client_key = (conn_info.client_ip, conn_info.client_port)
-    packet_queue = get_packet_queue(client_key)
-    rto = rtt.rto
-    retries = 0
-    dup_count = 0
-    deadline = time.time() + rto
+    # client_key = (conn_info.client_ip, conn_info.client_port)
+    # packet_queue = get_packet_queue(client_key)
+    # rto = rtt.rto
+    # retries = 0
+    # dup_count = 0
+    # deadline = time.time() + rto
 
     def retransmit_oldest(reason):
-        seg_seq = next(iter(unacked))            # first key = oldest segment
-        seg_chunk = unacked[seg_seq][0]
+        record = unacked[0]
+        seg_seq = record.seq            # seq đầu của phần dữ liệu còn chờ ACK
+        seg_chunk = record.payload
+        
+        sent_at = time.monotonic()
+
         send_tcp_data_segment(
             s, conn_info.server_ip, conn_info.client_ip,
             conn_info.server_port, conn_info.client_port,
-            seq=seg_seq, ack_seq=ack_seq, payload=seg_chunk
+            seq=seg_seq, ack_seq=conn_info.client_seq, payload=seg_chunk
         )
-        unacked[seg_seq] = (seg_chunk, time.time(), True)   # True = already retransmitted
+        record.last_sent_at = sent_at   # thời điểm gửi gần nhất
+        record.retransmitted = True
+        conn_info.timer_deadline = sent_at + rtt.rto
         print(f"[Streap_raw] wait_for_ack: RETRANSMIT seq={seg_seq} ({len(seg_chunk)} bytes), "
               f"reason: {reason}, RTO={rto*1000:.0f} ms, attempt {retries}")
 
-    while True:
-        left = deadline - time.time()
-        if left <= 0:                            # RTO expired
-            if retries >= MAX_RETRIES:
-                print(f"[Streap_raw] wait_for_ack: GIVE UP after {retries} retransmissions, last_byte_acked={last_byte_acked}")
+    with conn_info.cv:
+        while True:
+            # kiểm tra đầu loop
+            last_byte_acked = (conn_info.send_base - 1) & M32
+            if conn_info.error is not None:
                 return last_byte_acked, False
-            retries += 1
-            retransmit_oldest("RTO expired")     # the log shows the RTO that just expired
-            rto = min(rto * 2, MAX_RTO)          # next wait is twice as long (exponential backoff)
-            dup_count = 0
-            deadline = time.time() + rto
-            continue
-        try:
-            packet, addr = packet_queue.get(timeout=left)
-        except queue.Empty:
-            continue
-
-        ihl = (packet[0] & 0x0F) * 4
-        tcp_packet = packet[ihl:]
-        if len(tcp_packet) < 20:
-            continue
-        tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
-        src_port, dest_port, pkt_ack, flags = tcph[0], tcph[1], tcph[3], tcph[5]
-        if src_port != conn_info.client_port or dest_port != conn_info.server_port:
-            continue
-        if not (flags & 0x10):                   # no ACK flag
-            continue
-
-        new_last = (pkt_ack - 1) & M32           # ACK number = next byte expected, so last byte received = ACK - 1
-        if seq_diff(new_last, last_byte_acked) > 0:          # NEW ACK: advance
-            last_byte_acked = new_last
-            newest_sent_at = None
-            for seg_seq in list(unacked):
-                seg_chunk, seg_sent_at, was_retx = unacked[seg_seq]
-                seg_last_byte = (seg_seq + len(seg_chunk) - 1) & M32     # last byte of the segment
-                if seq_diff(last_byte_acked, seg_last_byte) >= 0:
-                    del unacked[seg_seq]
-                    if not was_retx:             # Karn: do not sample RTT from retransmitted segments
-                        newest_sent_at = seg_sent_at
-            if newest_sent_at is not None:
-                sample = time.time() - newest_sent_at
-                rtt.update(sample)
-                print(f"[Streap_raw] wait_for_ack: RTT sample={sample*1000:.1f} ms, "
-                      f"Est={rtt.est*1000:.1f} ms, Dev={rtt.dev*1000:.1f} ms, RTO={rtt.rto*1000:.1f} ms")
-            print(f"[Streap_raw] wait_for_ack: ACK={pkt_ack} (last_byte_acked={last_byte_acked}, "
-                  f"{seq_diff(last_byte_sent, last_byte_acked)} bytes remaining, {len(unacked)} unacked segments)")
-            if seq_diff(last_byte_acked, last_byte_sent) >= 0:
+            if seq_diff(conn_info.send_base, target) >= 0:
                 return last_byte_acked, True
-            retries = 0
-            dup_count = 0
+            if not unacked or conn_info.timer_deadline is None:
+                raise RuntimeError("Chưa đạt mốc ACK nhưng buffer hoặc timer không hợp lệ")
             rto = rtt.rto
-            deadline = time.time() + rto         # progress made: restart the timer
+            retries = conn_info.retry_count
+            deadline = conn_info.timer_deadline
+            left = deadline - time.monotonic()
 
-        elif new_last == last_byte_acked and unacked:        # DUPLICATE ACK
-            tcp_hdr_len = ((tcp_packet[12] >> 4) & 0x0F) * 4
-            pure_ack = len(tcp_packet) == tcp_hdr_len and not (flags & 0x07)   # no SYN/RST/FIN, no data
-            if pure_ack:
-                dup_count += 1
-                print(f"[Streap_raw] wait_for_ack: duplicate ACK #{dup_count} (ack={pkt_ack})")
-                if dup_count == 3:
-                    retransmit_oldest("3 duplicate ACKs (fast retransmit)")
-                    deadline = time.time() + rto
+            if left <= 0:                            # RTO expired
+                # phần xử lý timeout
+                if retries >= MAX_RETRIES:
+                    print(f"[Streap_raw] wait_for_ack: GIVE UP after {retries} retransmissions, last_byte_acked={last_byte_acked}")
+                    conn_info.error = TimeoutError("Đã hết số lần gửi lại cho phép")
+                    conn_info.timer_deadline = None
+                    conn_info.fast_retransmit_pending = False
+                    conn_info.cv.notify_all()
+                    return last_byte_acked, False
+                retries += 1
+                conn_info.retry_count = retries
+                conn_info.dup_ack_count = 0
+                conn_info.fast_retransmit_pending = False
+                rto = min(rto * 2, MAX_RTO)          # next wait is twice as long (exponential backoff)
+                rtt.rto = rto
+                retransmit_oldest("RTO expired")     # RTO trong log là khoảng chờ mới
+                continue
+            # try:
+            #     packet, addr = packet_queue.get(timeout=left)
+            # except queue.Empty:
+            #     continue
+
+            # ihl = (packet[0] & 0x0F) * 4
+            # tcp_packet = packet[ihl:]
+            # if len(tcp_packet) < 20:
+            #     continue
+            # tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
+            # src_port, dest_port, pkt_ack, flags = tcph[0], tcph[1], tcph[3], tcph[5]
+            # if src_port != conn_info.client_port or dest_port != conn_info.server_port:
+            #     continue
+            # if not (flags & 0x10):                   # no ACK flag
+            #     continue
+
+            # new_last = (pkt_ack - 1) & M32           # ACK number = next byte expected, so last byte received = ACK - 1
+            # if seq_diff(new_last, last_byte_acked) > 0:          # NEW ACK: advance
+            #     last_byte_acked = new_last
+            #     newest_sent_at = None
+            #     for seg_seq in list(unacked):
+            #         seg_chunk, seg_sent_at, was_retx = unacked[seg_seq]
+            #         seg_last_byte = (seg_seq + len(seg_chunk) - 1) & M32     # last byte of the segment
+            #         if seq_diff(last_byte_acked, seg_last_byte) >= 0:
+            #             del unacked[seg_seq]
+            #             if not was_retx:             # Karn: do not sample RTT from retransmitted segments
+            #                 newest_sent_at = seg_sent_at
+            #     if newest_sent_at is not None:
+            #         sample = time.time() - newest_sent_at
+            #         rtt.update(sample)
+            #         print(f"[Streap_raw] wait_for_ack: RTT sample={sample*1000:.1f} ms, "
+            #             f"Est={rtt.est*1000:.1f} ms, Dev={rtt.dev*1000:.1f} ms, RTO={rtt.rto*1000:.1f} ms")
+            #     print(f"[Streap_raw] wait_for_ack: ACK={pkt_ack} (last_byte_acked={last_byte_acked}, "
+            #         f"{seq_diff(last_byte_sent, last_byte_acked)} bytes remaining, {len(unacked)} unacked segments)")
+            #     if seq_diff(last_byte_acked, last_byte_sent) >= 0:
+            #         return last_byte_acked, True
+            #     retries = 0
+            #     dup_count = 0
+            #     rto = rtt.rto
+            #     deadline = time.time() + rto         # progress made: restart the timer
+
+            # elif new_last == last_byte_acked and unacked:        # DUPLICATE ACK
+            #     tcp_hdr_len = ((tcp_packet[12] >> 4) & 0x0F) * 4
+            #     pure_ack = len(tcp_packet) == tcp_hdr_len and not (flags & 0x07)   # no SYN/RST/FIN, no data
+            #     if pure_ack:
+            #         dup_count += 1
+            #         print(f"[Streap_raw] wait_for_ack: duplicate ACK #{dup_count} (ack={pkt_ack})")
+            #         if dup_count == 3:
+            #             retransmit_oldest("3 duplicate ACKs (fast retransmit)")
+            #             deadline = time.time() + rto
+
+            # trách nhiệm xử lý ACK đã được chuyển sang hàm on_ack()
+            if conn_info.fast_retransmit_pending:
+                conn_info.fast_retransmit_pending = False
+                retransmit_oldest("3 duplicate ACKs cần fast retransmit")
+                continue
+            conn_info.cv.wait(timeout=left)
             
 def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> int:
     """
@@ -957,36 +1072,53 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
             return -1
         session = connections[client_key]
     
-    seq = session.server_seq
     total = 0
-    unacked = {}
-    rtt = RttEstimator()
-    try:
-        for chunk in split_into_segments(payload):
-            send_tcp_data_segment(
-                s, listen_ip, client_ip, listen_port, client_port,
-                seq=seq, ack_seq=session.client_seq, payload=chunk
-            )
-            unacked[seq] = (chunk, time.time(), False)
-            seq = (seq + len(chunk)) & M32
-            total += len(chunk)
+    with session.cv:
+        start_seq = session.server_seq
 
+    try:
+        # server_seq dùng để biểu diễn sequence dành cho byte dữ liệu mới tiếp theo (chapter 3 tương ứng với NextSeqNum)
+        for chunk in split_into_segments(payload):  # slide 77 chapter 3 chia dữ liệu theo MSS)
+            with session.cv:
+                if session.error is not None:
+                    return -1
+                segment_seq = session.server_seq   # slide 78, 79 chapter 3 seq đánh số byte đầu trong segment
+                sent_at = time.monotonic()
+
+                send_tcp_data_segment(
+                    s, listen_ip, client_ip, listen_port, client_port,
+                    seq=segment_seq, ack_seq=session.client_seq, payload=chunk
+                )
+
+                session.unacked.append(OutstandingSegment(seq=segment_seq, payload=chunk, first_sent_at=sent_at, last_sent_at=sent_at)) # slide 79, 146 chapter 3: giữ dữ liệu chưa ACK để có thể gửi lại
+                session.server_seq = (segment_seq + len(chunk)) & M32    # slide 146 chapter 3: NextSeqNum = NextSeqNum + length(data)
+                if session.timer_deadline is None: 
+                    session.timer_deadline = sent_at + session.rtt.rto  # slide 84, 146 chapter 3: khởi động timer nếu chưa chạy
+            
+            total += len(chunk)    
+        with session.cv:
+            target_seq = session.server_seq # ACK phải tiến đến mốc này để xác nhận hết lần gửi
+            ack_seq = session.client_seq
+    
         print(f"[Streap_raw] run_conn_send Sent {total} bytes in segments to {client_ip}:{client_port}")
-        last_byte_acked, all_acked = wait_for_ack(s, conn_info, session.server_seq, seq, unacked, rtt, session.client_seq)
-        print(f"[Streap_raw] run_conn_send ACK {'COMPLETE' if all_acked else 'INCOMPLETE'}: LastByteAcked={last_byte_acked}, LastByteSent={(seq - 1) & M32}, {len(unacked)} unacked segments")
+        last_byte_acked, all_acked = wait_for_ack(s, session, start_seq, target_seq, session.unacked, session.rtt, ack_seq)   # start_seq into wait_for_ack()
+
+        with session.cv:
+            print(f"[Streap_raw] run_conn_send ACK {'COMPLETE' if all_acked else 'INCOMPLETE'}: LastByteAcked={last_byte_acked}, LastByteSent={(target_seq - 1) & M32}, {len(session.unacked)} unacked segments")
         if not all_acked:
             print(f"[Streap_raw] run_conn_send FAILED: client did not ACK all data")
-            return -1            # does not update server_seq
+            return -1            # không lùi server_seq về start_seq khi chưa được ACK toàn bộ
 
-        with connections_lock:
-            if client_key in connections:
-                # use the latest entry in the table, not the stale `session` copy
-                connections[client_key] = connections[client_key]._replace(
-                    server_seq=seq, last_activity=time.time()
-                )
         return total
 
     except Exception as e:
+        with session.cv:
+            if session.error is None:
+                session.error = e
+            session.timer_deadline = None
+            session.fast_retransmit_pending = False
+            session.cv.notify_all()
+
         print(f"[Streap_raw] run_conn_send Error in run_conn_send: {e}")
         return -1
 
