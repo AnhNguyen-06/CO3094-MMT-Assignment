@@ -164,43 +164,49 @@ class HttpAdapter:
 
         print("[HttpAdapter] Invoke handle_client_raw for {}:{}".format(conn_info.client_ip, conn_info.client_port))
 
-        # Receive data using streaprous raw connection
-        data = run_conn_recv(raw_socket, conn_info)
+        # (3-77, 2-27, 2-28, 2-29)
+        data = bytearray()
+        content_length = 0
+        header_end = -1
+        while True:
+            chunk = run_conn_recv(raw_socket, conn_info)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if header_end == -1:
+                idx = data.find(b"\r\n\r\n")
+                if idx != -1:
+                    header_end = idx + 4
+                    header_text = data[:idx].decode("utf-8", errors="ignore")
+                    for line in header_text.split("\r\n")[1:]:
+                        if ":" in line:
+                            k, v = line.split(":", 1)
+                            if k.strip().lower() == "content-length":
+                                try:
+                                    content_length = int(v.strip())
+                                except ValueError:
+                                    content_length = 0
+            if header_end != -1 and len(data) >= header_end + content_length:
+                break
         
         if not data:
             print("[HttpAdapter] No data received or connection closed")
+            close_connection(raw_socket, conn_info)
             return
-
-        # Prepare request
-        msg = data.decode("utf-8")
+        msg = bytes(data).decode("utf-8", errors="ignore")
         req.prepare(msg, routes)
-        
-        # Handle request hook
         if req.hook:
-            #
-            # TODO: handle for App hook here
-            #
-            response = ""
+            response = b""
         else:
-            # Build response - returns bytes
             response = resp.build_response(req)
-        
-        # Send response using streaprous raw connection
+
         response = response if isinstance(response, bytes) else response.encode("utf-8")
         print(f"[HttpAdapter] HTTP Response ({len(response)} bytes): {response[:200]}")
-        #
-        # TODO run_conn_send packet
-        # run_conn_send(..)
+        sent = run_conn_send(raw_socket, conn_info, response)
+        if sent < 0:
+            print("[HttpAdapter] Failed to send full HTTP response")
+        close_connection(raw_socket, conn_info)
         
-        # Wait longer to ensure response is transmitted, client processes it, and sends ACK
-        import time
-        time.sleep(5.0)
-        
-        # Close connection with FIN packet
-        #
-        # TODO run_conn_send packet
-        # close_connection(...)
-
     async def handle_client_coroutine(self, reader, writer):
         """
         Handle an incoming client connection using stream reader writer asynchronously.
