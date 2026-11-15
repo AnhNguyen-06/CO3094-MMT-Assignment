@@ -25,7 +25,7 @@ import sys
 import threading
 import time
 import queue
-from collections import namedtuple
+from collections import namedtuple, deque
 import netifaces
 
 # Import streaprout packet dispatcher functions
@@ -39,84 +39,137 @@ from .streaprous_packet_dispatcher import (
 )
 
 
-# Connection structure 
-# This structure holds connection and its state information
-conn_struct = namedtuple('conn_struct', [
-    'client_ip',
-    'client_port',
-    'server_ip',
-    'server_port',
-    'state',
-    'server_seq',
-    'client_seq',
-    'expected_final_ack',
-    'last_activity'
-])
-
-
-# Global table to manage multiple connection
-# The mapping include {key: value} as { (client_ip, client_port): conn_struct }
-connections = {}
-connections_lock = threading.Lock()
-
-# Management structure to serialize the 3-way handshake
-# Each hand shake is manage by a unique ID client_key
-# including client_ip client_port
-handshake_lock = threading.Lock()
-handshake_in_progress = {}
-
-
-# Default raw port listener
-DEFAULT_LISTEN_IP = "0.0.0.0"
-DEFAULT_LISTEN_PORT = 22239
-DEFAULT_INTERFACE_NAME = "lo0"
-
-# ---------------------------------------------------------------------------
-# Reliability helpers
-# ---------------------------------------------------------------------------
-MSS = 1300 
-M32 = 0xFFFFFFFF
-
-def seq_diff(a, b):
-    """a - b in modulo 2^32 arithmetic, returned as a signed number (handles sequence number wraparound)."""
-    d = (a - b) & M32
-    return d - (M32 + 1) if d >= 0x80000000 else d
-
-def classify_segment(rcv_nxt, seq, length):
-    """Classify a segment relative to the expected byte (rcv_nxt)."""
-    d = seq_diff(seq, rcv_nxt)
-    if d == 0:
-        return "in_order"
-    if d < 0 and d + length <= 0:
-        return "duplicate"          # the whole segment was already received
-    return "gap_or_overlap"         # there is a gap or overlap
-
-def split_into_segments(payload, mss=MSS):
-    return [payload[i:i + mss] for i in range(0, len(payload), mss)]
-
-# --- RTT / RTO estimation and retransmission ---
-ALPHA = 0.125       # weight of the new sample in EstimatedRTT
-BETA = 0.25         # weight of the new sample in DevRTT
-INITIAL_RTO = 1.0   # seconds, used when no RTT samples are available
-MIN_RTO = 0.2       # seconds, lower bound (RTT in LAN networks is very small)
-MAX_RTO = 10.0      # seconds, upper bound
-MAX_RETRIES = 5     # maximum number of consecutive retransmissions before giving up
+# RTT/RTO estimation and retransmission (3-82, 3-83)
+ALPHA = 0.125 
+BETA = 0.25 
+INITIAL_RTO = 1.0 
+MIN_RTO = 0.2 
+MAX_RTO = 10.0
+MAX_RETRIES = 5
 
 class RttEstimator:
-    """Calculate EstimatedRTT, DevRTT and RTO from RTT samples (in seconds)."""
+    """ Calculate EstimatedRTT, DevRTT and RTO from RTT samples """
     def __init__(self):
         self.est = None
         self.dev = None
         self.rto = INITIAL_RTO
 
     def update(self, sample):
-        if self.est is None:                   # first sample
+        if self.est is None:
             self.est = sample
             self.dev = sample / 2
         else:
             self.dev = (1 - BETA) * self.dev + BETA * abs(sample - self.est)
             self.est = (1 - ALPHA) * self.est + ALPHA * sample
         self.rto = min(max(self.est + 4 * self.dev, MIN_RTO), MAX_RTO)
+
+class UnackedSegment:
+    """ Một phần tử trong conn.unacked (dành cho sender) """
+    def __init__(self, seq, payload, first_sent_at, last_sent_at=None, retransmitted=False):
+        self.seq = seq
+        self.payload = payload
+        self.first_sent_at = first_sent_at
+        self.last_sent_at = first_sent_at if last_sent_at is None else last_sent_at
+        self.retransmitted = retransmitted
+
+class TcpSegment:
+    """ Cấu trúc segment đã qua kiểm tra header/checksum để truyền vào on_ack """
+    def __init__(self, seq, ack, flags, payload=b"", window=0):
+        self.seq = seq
+        self.ack = ack
+        self.flags = flags
+        self.payload = payload
+        self.window = window
+
+class conn_struct:
+    """ Đối tượng trạng thái kết nối giữa sender và receiver
+        3-20, 3-21
+        3-84, 3-146
+        3-68, 3-90, 3-96, 3-145
+        3-101, 3-104, 3-147 """
+    def __init__(
+        self,
+        client_ip,
+        client_port,
+        server_ip,
+        server_port,
+        state="LISTEN",
+        server_seq=2000,
+        client_seq=0,
+        expected_final_ack=0,
+        last_activity=None,
+        send_base=None,
+    ):
+        # Địa chỉ 4-tuple và trạng thái kết nối hiện có
+        self.client_ip = client_ip
+        self.client_port = client_port
+        self.server_ip = server_ip
+        self.server_port = server_port
+        self.state = state
+        self.expected_final_ack = expected_final_ack
+        self.last_activity = time.time() if last_activity is None else last_activity
+    
+        # Các trường Sequence / ACK
+        self.server_seq = server_seq
+        self.send_base = server_seq if send_base is None else send_base
+        self.client_seq = client_seq
+
+        # Các trường phía Sender
+        self.unacked = deque()
+        self.rtt = RttEstimator()
+        self.timer_deadline = None
+        self.dup_ack_count = 0
+        self.retry_count = 0
+
+        # Khóa đồng bộ dùng chung
+        self.cv = threading.Condition()
+        self.send_lock = threading.Lock()
+
+        # Các trường phía receiver
+        self.recv_buffer = bytearray()
+        self.peer_eof = False
+        self.error = None
+
+    def _replace(self, **kwargs):
+        with self.cv:
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+        return self
+
+def on_ack(conn, segment, received_at=None):
+    return "old"
+
+connections = {}
+connections_lock = threading.Lock()
+
+handshake_lock = threading.Lock()
+handshake_in_progress = {}
+
+DEFAULT_LISTEN_IP = "0.0.0.0"
+DEFAULT_LISTEN_PORT = 22239
+DEFAULT_INTERFACE_NAME = "lo0"
+
+MSS = 1300
+M32 = 0xFFFFFFFF
+
+def seq_diff(a, b):
+    d = (a - b) & M32
+    return d - (M32 + 1) if d >= 0x80000000 else d 
+
+def classify_segment(rcv_next, seq, length):
+    """ Phân loại segment nhạn được so với byte mong đợi tiếp theo rcv_next """
+    """ Slide 3-68, 3-78, 3-79, 3-85 """
+    d = seq_diff(seq, rcv_next)
+    if d == 0:
+        return "in_order"
+    if d < 0:
+        if d + length <= 0:
+            return "duplicate" # toàn bộ các byte trong gói đã nhận trước đó (3-52, 3-61)
+        return "partial_overlap" # phần đầu (-d bytes) trùng, phần đuôi là byte mới từ rcv_next (3-78, 3-79)
+    return "gap" # d>0: gói đến sớm hơn rcv_next, có gap (3-68, 3-85)
+
+def split_into_segments(payload, mss=MSS):
+    return [payload[i:i + mss] for i in range(0, len(payload), mss)]
 
 
 def register_keep_port_alive(listen_ip="0.0.0.0", listen_port=22239, retry_interval=10):
@@ -189,13 +242,32 @@ def checksum(msg):
     return ~s & 0xffff
 
 def verify_tcp_checksum(packet):
-    """Return True if the TCP checksum of a received IP packet is valid."""
-    ihl = (packet[0] & 0x0F) * 4
-    total = struct.unpack('!H', packet[2:4])[0]           # IP total length
-    tcp = packet[ihl:total]
-    pseudo = packet[12:16] + packet[16:20] + struct.pack('!BBH', 0, socket.IPPROTO_TCP, len(tcp))
-    return checksum(pseudo + tcp) == 0
+    """Return True if the TCP checksum of a received IPv4 packet is valid.
+    Grounded in Chapter 4 (Slide 4-43: IP datagram format) and
+    Chapter 3 (Slide 3-31..3-34, 3-78: Internet checksum & TCP segment structure).
+    """
+    if not isinstance(packet, (bytes, bytearray)) or len(packet) < 40: # gói IPv4 + TCP tối thiểu 40 bytes (Slide 4-43, 3-78)
+        return False
 
+    version = (packet[0] >> 4) & 0x0F
+    ihl = (packet[0] & 0x0F) * 4 # kiểm tra đúng IPv4 và độ dài IP header >= 20 bytes (Slide 4-43)
+    if version != 4 or ihl < 20 or len(packet) < ihl + 20:
+        return False
+
+    total = struct.unpack('!H', packet[2:4])[0]
+    if total < ihl + 20 or len(packet) < total: # đảm bảo total length hợp lệ và gói không bị cắt cụt (Slide 4-43)
+        return False
+
+    if packet[9] != socket.IPPROTO_TCP: # giao thức tầng trên phải là TCP = 6 (Slide 4-43)
+        return False
+
+    tcp = packet[ihl:total]
+    tcp_header_len = ((tcp[12] >> 4) & 0x0F) * 4 # kiểm tra head len của TCP >= 20 và <= len(tcp) (Slide 3-78)
+    if tcp_header_len < 20 or len(tcp) < tcp_header_len:
+        return False
+
+    pseudo = packet[12:16] + packet[16:20] + struct.pack('!BBH', 0, socket.IPPROTO_TCP, len(tcp))
+    return checksum(pseudo + tcp) == 0 # kiểm tra tổng kiểm 16-bit bù 1 (Slide 3-31..3-34, 3-44)
 
 def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, ack=0, fin=0):
     """Stitches a structurally flawless 20-byte TCP header.
@@ -463,12 +535,11 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
             except queue.Empty:
                 continue
 
-            # Extract IP Header Length
-            ihl = (packet[0] & 0x0F) * 4
-            tcp_packet = packet[ihl:]
-            
-            if len(tcp_packet) < 20:
+            if not verify_tcp_checksum(packet):
                 continue
+            ihl = (packet[0] & 0x0F) * 4
+            total = struct.unpack('!H', packet[2:4])[0]
+            tcp_packet = packet[ihl:total]
 
             # Unpack the received TCP header
             tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
@@ -528,7 +599,7 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
 
                 # STEP 2: Reply SYN-ACK immediately
                 # Build TCP packet for SYN-ACK
-                next_ack = pkt_seq + 1
+                next_ack = (pkt_seq + 1) & M32
                 syn_ack_packet = build_tcp_packet(send_ip, client_ip, listen_port, client_port,
                                                   seq=server_seq, ack_seq=next_ack, syn=1, ack=1)
                 ip_header = build_ip_header(send_ip, client_ip, socket.IPPROTO_TCP, len(syn_ack_packet))
@@ -550,8 +621,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                         server_port=listen_port,
                         state="SYN_RCVD",
                         server_seq=server_seq,
-                        client_seq=pkt_seq,
-                        expected_final_ack=server_seq + 1,
+                        client_seq=next_ack,
+                        expected_final_ack=(server_seq + 1) & M32,
                         last_activity=time.time()
                     )
                     session = connections[client_key]
@@ -567,12 +638,11 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                         print(f"[Streap_raw] accept: Per-connection queue empty for {client_ip}:{client_port}, waiting...")
                         continue
 
-                    # Extract IP Header Length
-                    ihl = (packet[0] & 0x0F) * 4
-                    tcp_packet = packet[ihl:]
-                    
-                    if len(tcp_packet) < 20:
+                    if not verify_tcp_checksum(packet):
                         continue
+                    ihl = (packet[0] & 0x0F) * 4
+                    total = struct.unpack('!H', packet[2:4])[0]
+                    tcp_packet = packet[ihl:total]
 
                     # Unpack the received TCP header
                     tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
@@ -589,38 +659,36 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                     print(f"[Streap_raw] accept: Received packet in handshake wait - SYN={syn_flag}, ACK={ack_flag}, Seq={pkt_seq}, Ack={pkt_ack}")
 
                     # Check if this is the final ACK (ACK only, no SYN)
-                    if syn_flag == 0 and ack_flag == 1:
+                    if syn_flag == 1 and ack_flag == 0:
+                        s.sendto(full_packet, (client_ip, 0))
+                        continue
+                    if syn_flag == 0 and ack_flag == 1 and pkt_ack == session.expected_final_ack and pkt_seq == session.client_seq:
                         print(f"[Streap_raw] accept: handshake3 Received FIN-ACK from Client (Seq={pkt_seq}, Ack={pkt_ack})")
-
+                        tcp_header_len = ((tcp_packet[12] >> 4) & 0x0F) * 4
+                        app_payload = tcp_packet[tcp_header_len:]
                         with connections_lock:
                             if session.state != "SYN_RCVD":
                                 print(f"[Streap_raw] accept: Non handshake state for {client_ip}:{client_port}")
                                 break
-
-                            # Update connection to ESTABLISHED
-                            connections[client_key] = conn_struct(
-                                client_ip=client_ip,
-                                client_port=client_port,
-                                server_ip=send_ip,
-                                server_port=listen_port,
-                                state="ESTABLISHED",
-                                server_seq=pkt_ack,
-                                client_seq=pkt_seq,
-                                expected_final_ack=session.expected_final_ack,
-                                last_activity=time.time()
-                            )
-                            session = connections[client_key]
-
-                        # Clear handshake in progress flag
+                            with session.cv:
+                                session.state = "ESTABLISHED"
+                                session.server_seq = pkt_ack
+                                session.send_base = pkt_ack
+                                session.client_seq = (pkt_seq + len(app_payload)) & M32
+                                if len(app_payload) > 0:
+                                    session.recv_buffer.extend(app_payload)
+                                session.last_activity = time.time()
+                        
+                        if len(app_payload) > 0:
+                            ack_packet = build_tcp_packet(send_ip, client_ip, listen_port, client_port, seq=session.server_seq, ack_seq=session.client_seq, ack=1)
+                            ip_header = build_ip_header(send_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
+                            s.sendto(ip_header + ack_packet, (client_ip, 0))
                         with handshake_lock:
                             handshake_in_progress[client_key] = False
-
-                        print(f"[Streap_raw] Etablished handshak with connection: ({client_ip}:{client_port}) ESTABLISHED")
                         
-                        # Return the established connection info
+                        print(f"[Streap_raw] Etablished handshak with connection: ({client_ip}:{client_port}) ESTABLISHED")
                         return session
-                
-                # Fallback of the handshake timeout
+                    
                 print(f"[Streap_raw] Handshake timeout for {client_ip}:{client_port}")
                 with handshake_lock:
                     handshake_in_progress[client_key] = False
@@ -628,40 +696,36 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                 with connections_lock:
                     connections.pop(client_key, None)
                 continue
-
-            # STEP 3 Exception handling: Capture FIN ACK on SYN queue ---
-            if session.state == "SYN_RCVD" and syn_flag == 0 and ack_flag == 1:
+                
+            if session.state == "SYN_RCVD" and syn_flag == 0 and ack_flag == 1 and pkt_ack == session.expected_final_ack and pkt_seq == session.client_seq:
                 print(f"[Streap_raw] accept: handshake3 received Final ACK from Client on SYN queue (Seq={pkt_seq}, Ack={pkt_ack})")
                 print(f"[Streap_raw] accept: Fallback - got final ACK on SYN queue for {client_ip}:{client_port}")
+                tcp_header_len = ((tcp_packet[12] >> 4) & 0x0F) * 4
+                app_payload = tcp_packet[tcp_header_len:]
 
                 with connections_lock:
                     if session.state != "SYN_RCVD":
                         print(f"[Streap_raw] accept: Non handshake state for {client_ip}:{client_port}")
                         continue
-
-                    # Update connection to ESTABLISHED
-                    connections[client_key] = conn_struct(
-                        client_ip=client_ip,
-                        client_port=client_port,
-                        server_ip=send_ip,
-                        server_port=listen_port,
-                        state="ESTABLISHED",
-                        server_seq=pkt_ack,
-                        client_seq=pkt_seq,
-                        expected_final_ack=session.expected_final_ack,
-                        last_activity=time.time()
-                    )
-                    session = connections[client_key]
-
-                # Clear handshake in progress flag
+                    with session.cv:
+                        session.state = "ESTABLISHED"
+                        session.server_seq = pkt_ack
+                        session.send_base = pkt_ack
+                        session.client_seq = (pkt_seq + len(app_payload)) & M32
+                        if len(app_payload) > 0:
+                            session.recv_buffer.extend(app_payload)
+                        session.last_activity = time.time()
+                    
+                if len(app_payload) > 0:
+                    ack_packet = build_tcp_packet(send_ip, client_ip, listen_port, client_port, seq=session.server_seq, ack_seq=session.client_seq, ack=1)
+                    ip_header = build_ip_header(send_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
+                    s.sendto(ip_header + ack_packet, (client_ip, 0))
+                    
                 with handshake_lock:
                     handshake_in_progress[client_key] = False
-
                 print(f"[Streap_raw] Etablished handshak with connection: ({client_ip}:{client_port}) ESTABLISHED")
-                
-                # Return the established connection info
                 return session
-
+                            
     except KeyboardInterrupt:
         print("\n[-] Server stopped.")
         # Clear handshake flags on interrupt
@@ -670,7 +734,7 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
         raise
 
 
-def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
+def run_conn_recv(s: socket.socket, session: conn_struct) -> bytes:
     """
     Receive data on an established connection using raw sockets.
     This function handles incoming packets for a specific connection by reading
@@ -683,11 +747,16 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
     Returns:
         bytes: The received data payload, or empty bytes if connection closed
     """
-    client_ip = conn_info.client_ip
-    client_port = conn_info.client_port
+    """
+    Gặp ACK: gọi on_ack cho sender (3-80, 3-84)
+    Gặp data: kiểm tra thứ tự, lưu vào session.recv_buffer (3-90, 3-91)
+    Gặp FIN/RST: cập nhật peer_eof/error (3-104)
+    """
+    client_ip = session.client_ip
+    client_port = session.client_port
+    listen_ip = session.server_ip
+    listen_port = session.server_port
     client_key = (client_ip, client_port)
-    listen_ip = conn_info.server_ip
-    listen_port = conn_info.server_port
     
     # Get the packet queue for this connection from the dispatcher
     packet_queue = get_packet_queue(client_key)
@@ -696,28 +765,39 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
     
     try:
         while True:
+            with session.cv:
+                if len(session.recv_buffer) > 0:
+                    data = bytes(session.recv_buffer)
+                    session.recv_buffer.clear()
+                    return data
+                if session.peer_eof or session.state == "CLOSED" or session.error is not None:
+                    return b""
+            
             # Get packet from the dispatcher queue instead of reading directly from socket
             try:
-                packet, addr = packet_queue.get(timeout=1.0)
+                packet, addr = packet_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
-            # Extract IP Header Length
-            ihl = (packet[0] & 0x0F) * 4
-            tcp_packet = packet[ihl:]
-            
-            if len(tcp_packet) < 20:
+            if not verify_tcp_checksum(packet):
                 continue
+            ihl = (packet[0] & 0x0F) * 4
+            total = struct.unpack('!H', packet[2:4])[0]
+            tcp_packet = packet[ihl:total]
 
             # Unpack the received TCP header
             tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
-            src_port, dest_port, pkt_seq, pkt_ack, flags = (
+            src_port, dest_port, pkt_seq, pkt_ack, flags, window = (
                 tcph[0],
                 tcph[1],
                 tcph[2],
                 tcph[3],
                 tcph[5],
+                tcph[6],
             )
+            tcp_header_len = ((tcp_packet[12] >> 4) & 0x0F) * 4
+            app_payload = tcp_packet[tcp_header_len:]
+            has_data = len(app_payload) > 0
 
             # Bypass non-listen port
             if dest_port != listen_port:
@@ -734,50 +814,40 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
             rst_flag = (flags & 0x04) >> 2
 
             print(f"[Streap_raw] run_conn_recv: Received packet from {client_ip}:{client_port} (SYN={syn_flag}, ACK={ack_flag}, PSH={psh_flag}, FIN={fin_flag}, RST={rst_flag}, Seq={pkt_seq}, Ack={pkt_ack})")
-
-            with connections_lock:
-                if client_key not in connections:
-                    continue
-                session = connections[client_key]
-
-            # Handle FIN (connection close)
-            if fin_flag:
-                print(f"[Streap_raw] Received FIN from {client_ip}:{client_port}")
-                # Send ACK for FIN
-                ack_packet = build_tcp_packet(listen_ip, client_ip, listen_port, client_port,
-                                              seq=session.server_seq, ack_seq=pkt_seq + 1, ack=1)
-                ip_header = build_ip_header(listen_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
-                s.sendto(ip_header + ack_packet, (client_ip, 0))
-                
-                with connections_lock:
-                    if client_key in connections:
-                        del connections[client_key]
-                # Clean up packet queue
-                remove_packet_queue(client_key)
-                return b""
-
             # Handle RST (connection reset)
             if rst_flag:
                 print(f"[Streap_raw] Received RST from {client_ip}:{client_port}")
+                with session.cv:
+                    session.error = "Connection reset by peer"
+                    session.state = "CLOSED"
+                    session.cv.notify_all()
                 with connections_lock:
-                    if client_key in connections:
-                        del connections[client_key]
-                # Clean up packet queue
+                    connections.pop(client_key, None)
                 remove_packet_queue(client_key)
                 return b""
 
-            # Update last activity
-            with connections_lock:
-                if client_key in connections:
-                    connections[client_key] = session._replace(last_activity=time.time())
+            # Xử lý ACK cho mọi segment có cờ ACK hợp lệ (3-80)
+            # quy ước: gọi on_ack() ở ngoài khóa session.cv để on_ack() tự lấy session.cv bên trong
+            if ack_flag and not syn_flag:
+                segment = TcpSegment(
+                    seq=pkt_seq,
+                    ack=pkt_ack,
+                    flags=flags,
+                    payload=app_payload,
+                    window=window,
+                )
+                on_ack(session, segment, time.time())
+            
+            with session.cv:
+                session.last_activity = time.time()
 
             # Handle data payload (PSH + ACK) or (ACK with data) - Fast path ACK
             # Some clients may not set PSH flag for small requests
-            has_data = len(tcp_packet) > ((tcp_packet[12] >> 4) & 0x0F) * 4
             
-            if (psh_flag and ack_flag) or (ack_flag and has_data and not syn_flag and not fin_flag and not rst_flag):
+            
+            if (psh_flag and ack_flag) or (ack_flag and has_data and not syn_flag and not rst_flag):
                 # Dynamically look up header length to bypass any incoming TCP Options
-                tcp_header_len = ((tcp_packet[12] >> 4) & 0x0F) * 4
+                
                 app_payload = tcp_packet[tcp_header_len:]
                 
                 if len(app_payload) > 0:
@@ -789,16 +859,17 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
                     
                     # Order check: accept only the segment that starts at the expected byte (client_seq)
                     kind = classify_segment(session.client_seq, pkt_seq, len(app_payload))
-                    if kind != "in_order":
+                    if kind == "partial_overlap":
+                        overlap_bytes = -seq_diff(pkt_seq, session.client_seq) # số byte đầu bị trùng
+                        app_payload = app_payload[overlap_bytes:]
+                        print(f"[Streap_raw] run_conn_recv: partial_overlap seq={pkt_seq}, trimmed {overlap_bytes}B, kept {len(app_payload)}B")
+                    elif kind != "in_order":
                         print(f"[Streap_raw] run_conn_recv: {kind} seq={pkt_seq}, expected={session.client_seq} -> dup ACK")
-                        dup_ack = build_tcp_packet(session.server_ip, client_ip, listen_port, client_port,
-                                                   seq=session.server_seq, ack_seq=session.client_seq, ack=1)
+                        dup_ack = build_tcp_packet(session.server_ip, client_ip, listen_port, client_port, seq=session.server_seq, ack_seq=session.client_seq, ack=1)
                         ip_header = build_ip_header(session.server_ip, client_ip, socket.IPPROTO_TCP, len(dup_ack))
                         s.sendto(ip_header + dup_ack, (client_ip, 0))
                         continue
-
-                    # Send ACK for received data IMMEDIATELY (fast path)
-                    next_ack = (pkt_seq + len(app_payload)) & M32
+                    next_ack = (session.client_seq + len(app_payload)) & M32       
 
                     ack_packet = build_tcp_packet(session.server_ip, client_ip, listen_port, client_port,
                                                   seq=session.server_seq, ack_seq=next_ack, ack=1)
@@ -807,26 +878,27 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
                     print(f"[Streap_raw] Sent ACK for data (Ack={next_ack})")
                     
                     # Update sequence numbers AFTER ACK sent
-                    with connections_lock:
-                        if client_key in connections:
-                            connections[client_key] = session._replace(
-                                server_seq=session.server_seq,
-                                client_seq=next_ack,
-                                last_activity=time.time()
-                            )
-                        
-                    # Return the received payload
-                    return app_payload
-
-            # Handle pure ACK (no data)
-            elif ack_flag and not syn_flag and not psh_flag and not has_data:
-                print(f"[Streap_raw] Received ACK from {client_ip}:{client_port} (Ack={pkt_ack})")
-                with connections_lock:
-                    if client_key in connections:
-                        connections[client_key] = session._replace(
-                            server_seq=pkt_ack,
-                            last_activity=time.time()
-                        )
+                    with session.cv:
+                        session.client_seq = next_ack
+                        session.recv_buffer.extend(app_payload)
+                        session.last_activity = time.time()
+                        session.cv.notify_all()
+            
+            # Handle FIN (connection close)
+            if fin_flag:
+                print(f"[Streap_raw] Received FIN from {client_ip}:{client_port}")
+                with session.cv:
+                    fin_ack = (session.client_seq + 1) & M32
+                    session.client_seq = fin_ack
+                    session.peer_eof = True
+                    if session.state == "ESTABLISHED":
+                        session.state = "CLOSE_WAIT"
+                    session.cv.notify_all()
+                # Send ACK for FIN
+                ack_packet = build_tcp_packet(listen_ip, client_ip, listen_port, client_port,
+                                              seq=session.server_seq, ack_seq=fin_ack, ack=1)
+                ip_header = build_ip_header(listen_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
+                s.sendto(ip_header + ack_packet, (client_ip, 0))
 
     except KeyboardInterrupt:
         print("\n[Streap_raw] Receive loop interrupted.")
@@ -887,10 +959,12 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq):
         except queue.Empty:
             continue
 
-        ihl = (packet[0] & 0x0F) * 4
-        tcp_packet = packet[ihl:]
-        if len(tcp_packet) < 20:
+        if not verify_tcp_checksum(packet):
             continue
+        ihl = (packet[0] & 0x0F) * 4
+        total = struct.unpack('!H', packet[2:4])[0]
+        tcp_packet = packet[ihl:total]
+        
         tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
         src_port, dest_port, pkt_ack, flags = tcph[0], tcph[1], tcph[3], tcph[5]
         if src_port != conn_info.client_port or dest_port != conn_info.server_port:
@@ -992,25 +1066,119 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
 
 
 def close_connection(s: socket.socket, conn_info: conn_struct):
-    """Close a specific connection by sending FIN and removing from connection table."""
+    """ Đóng kết nối TCP theo đúng FSM trong slide 3-103, 3-104:
+    - Nếu đang CLOSE_WAIT: gửi FIN -> sang LAST_ACK -> chờ ACK(fin_seq + 1) -> CLOSED
+    - Nếu đang ESTABLISHED: gửi FIN -> sang FIN_WAIT_1 -> chờ ACK(fin_seq + 1) (FIN_WAIT2) và chờ FIN từ peer -> gửi ACK -> TIMED_WAIT -> CLOSED """
     client_ip = conn_info.client_ip
     client_port = conn_info.client_port
     client_key = (client_ip, client_port)
     listen_ip = conn_info.server_ip
     listen_port = conn_info.server_port
-    
+
     with connections_lock:
-        if client_key in connections:
-            session = connections[client_key]
-            # Send FIN packet
-            fin_packet = build_tcp_packet(listen_ip, client_ip, listen_port, client_port,
-                                          seq=session.server_seq, ack_seq=session.client_seq, ack=1, fin=1)
-            ip_header = build_ip_header(listen_ip, client_ip, socket.IPPROTO_TCP, len(fin_packet))
-            s.sendto(ip_header + fin_packet, (client_ip, 0))
-            print(f"[Streap_raw] run_conn_send: Send FIN to {client_ip}:{client_port}")
-            del connections[client_key]
+        session = connections.get(client_key)
+    if session is None:
+        remove_packet_queue(client_key)
+        return
     
-    # Clean up packet queue
+    with session.cv:
+        if session.state == "CLOSED" or session.error is not None:
+            with connections_lock:
+                connections.pop(client_key, None)
+            remove_packet_queue(client_key)
+            return
+        fin_seq = session.server_seq
+        expected_fin_ack = (fin_seq + 1) & M32
+        session.server_seq = expected_fin_ack
+        if session.state == "CLOSE_WAIT":
+            session.state = "LAST_ACK"
+        else:
+            session.state = "FIN_WAIT_1"
+        ack_seq = session.client_seq
+    
+    packet_queue = get_packet_queue(client_key)
+    rto = session.rtt.rto
+    retries = 0
+    fin_acked = False
+
+    def send_fin():
+        with session.cv:
+            cur_ack = session.client_seq
+        fin_pkt = build_tcp_packet(listen_ip, client_ip, listen_port, client_port, seq=fin_seq, ack_seq=cur_ack, ack=1, fin=1)
+        ip_hdr = build_ip_header(listen_ip, client_ip, socket.IPPROTO_TCP, len(fin_pkt))
+        s.sendto(ip_hdr + fin_pkt, (client_ip, 0))
+        print(f"[Streap_raw] close_connection: Sent FIN (Seq={fin_seq}, Ack={cur_ack}, state={session.state})")
+    
+    send_fin()
+    deadline = time.time() + rto
+
+    while retries < MAX_RETRIES:
+        with session.cv:
+            if session.error is not None or session.state == "CLOSED":
+                break
+            if fin_acked and session.peer_eof:
+                session.state = "TIMED_WAIT"
+                break
+        left = deadline - time.time()
+        if left <= 0:
+            retries += 1
+            if not fin_acked and retries < MAX_RETRIES:
+                send_fin()
+                rto = min(rto * 2, MAX_RTO)
+                deadline = time.time() + rto
+                continue
+            break
+        try:
+            packet, addr = packet_queue.get(timeout=min(left, 0.5))
+        except queue.Empty:
+            continue
+        
+        if not verify_tcp_checksum(packet):
+            continue
+        ihl = (packet[0] & 0x0F) * 4
+        total = struct.unpack('!H', packet[2:4])[0]
+        tcp_packet = packet[ihl:total]
+        tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
+        src_port, dest_port, pkt_seq, pkt_ack, flags = tcph[0], tcph[1], tcph[2], tcph[3], tcph[5]
+        if src_port != client_port or dest_port != listen_port:
+            continue
+        
+        rst_flag = (flags & 0x04) >> 2
+        ack_flag = (flags & 0x10) >> 4
+        fin_flag = flags & 0x01
+        if rst_flag:
+            break
+        if ack_flag and seq_diff(pkt_ack, expected_fin_ack) >= 0:
+            fin_acked = True
+            with session.cv:
+                session.send_base = expected_fin_ack
+            if session.state == "LAST_ACK":
+                session.state = "CLOSED"
+                break
+            elif session.state == "FIN_WAIT_1":
+                session.state = "FIN_WAIT_2"
+            
+        if fin_flag:
+            tcp_header_len = ((tcp_packet[12] >> 4) & 0x0F) * 4
+            app_payload = tcp_packet[tcp_header_len:]
+            with session.cv:
+                if len(app_payload) > 0 and seq_diff(pkt_seq, session.client_seq) == 0:
+                    session.client_seq = (session.client_seq + len(app_payload)) & M32
+                    session.recv_buffer.extend(app_payload)
+                fin_ack_num = (session.client_seq + 1) & M32
+                session.client_seq = fin_ack_num
+                session.peer_eof = True
+                session.state = "TIMED_WAIT" if fin_acked else "CLOSING"
+            ack_pkt = build_tcp_packet(listen_ip, client_ip, listen_port, client_port, seq=session.server_seq, ack_seq=fin_ack_num, ack=1)
+            ip_hdr = build_ip_header(listen_ip, client_ip, socket.IPPROTO_TCP, len(ack_pkt))
+            s.sendto(ip_hdr + ack_pkt, (client_ip, 0))
+            if fin_acked:
+                break
+    with session.cv:
+        session.state = "CLOSED"
+        session.cv.notify_all()
+    with connections_lock:
+        connections.pop(client_key, None)
     remove_packet_queue(client_key)
 
 
