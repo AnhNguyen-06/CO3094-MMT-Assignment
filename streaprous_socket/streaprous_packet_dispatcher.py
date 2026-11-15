@@ -66,14 +66,16 @@ def _packet_dispatcher(s, listen_port):
 
             # Concurrently handle multiple packets
             with _packet_dispatcher_lock:
+                # queue of client
                 client_key = _packet_queues.get(key)
 
                 if client_key is not None:
                     # known client_key connection exist in queues
-                    target = client_key                                   
+                    target = client_key # target is the queue of that specific client                             
                     print(f"[Sock_dispatcher] Route packet to existing queue for {key} (flags=0x{flags:02x}, SYN={is_syn}, ACK={is_ack})")
                 elif is_syn:
                     # Non-established connection with syn handshaking
+                    # target is shared queue for incoming SYNs: _SYN_KEY
                     target = _packet_queues.setdefault(_SYN_KEY, queue.Queue(maxsize=100))
                     print(f"[Sock_dispatcher] Route SYN packet to SYN queue for {key}")
                 else:
@@ -81,7 +83,8 @@ def _packet_dispatcher(s, listen_port):
                     print(f"[Sock_dispatcher] Drop packet for {key} - no queue (flags=0x{flags:02x}, SYN={is_syn}, ACK={is_ack})")
                     continue
             try:
-                target.put_nowait((packet, addr))
+                # if queue is full, throw exception queue.Full
+                target.put_nowait((packet, addr)) 
             except queue.Full:
                 pass
         except Exception as e:
