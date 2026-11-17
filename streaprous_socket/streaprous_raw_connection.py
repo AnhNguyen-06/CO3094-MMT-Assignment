@@ -1076,9 +1076,16 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq):
     unacked: là conn_info.unacked
     rtt: là conn_info.rtt
     trả về (last_byte_acked, all_acked)
+
+    wait_for_ack(s, session, start_seq, None, unacked, rtt, ack_seq) khi kiểm tra timeout/fast retransmit rồi trả về
+    wait_for_ack(s, session, start_seq, target_seq, unacked, rtt, ack_seq) khi chờ ACK đạt mốc của lần gửi
     """
+    poll_only = (target is None) # biến thêm vào dùng để xem hàm này kiểm tra timeout/fast retransmit hay chờ đủ ACK
     last_byte_acked = (start - 1) & M32          # no byte acknowledged yet
-    last_byte_sent = (target - 1) & M32          # last byte of the response
+    if poll_only:
+        last_byte_sent = (conn_info.server_seq - 1) & 32
+    else:
+        last_byte_sent = (target - 1) & M32          # last byte of the response
     # if seq_diff(start, target) >= 0:             # nothing to wait for
     #     return last_byte_acked, True
 
@@ -1101,27 +1108,36 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq):
             conn_info.server_port, conn_info.client_port,
             seq=seg_seq, ack_seq=conn_info.client_seq, payload=seg_chunk
         )
-        record.last_sent_at = sent_at   # thời điểm gửi gần nhất
+        record.last_sent_at = sent_at   # slide 81 chapter 3: record retransmit sẽ bị loại khỏi phép lấy mẫu RTT
         record.retransmitted = True
-        conn_info.timer_deadline = sent_at + rtt.rto
+        conn_info.last_activity = time.time()
+        conn_info.timer_deadline = sent_at + rtt.rto # slide 84, 146 chapter 3
         print(f"[Streap_raw] wait_for_ack: RETRANSMIT seq={seg_seq} ({len(seg_chunk)} bytes), "
               f"reason: {reason}, RTO={rto*1000:.0f} ms, attempt {retries}")
 
     with conn_info.cv:
         while True:
-            # kiểm tra đầu loop
             last_byte_acked = (conn_info.send_base - 1) & M32
             if conn_info.error is not None:
                 return last_byte_acked, False
-            if seq_diff(conn_info.send_base, target) >= 0:
-                return last_byte_acked, True
-            if not unacked or conn_info.timer_deadline is None:
-                raise RuntimeError("Chưa đạt mốc ACK nhưng buffer hoặc timer không hợp lệ")
+            if not poll_only:
+                if seq_diff(conn_info.send_base, target) >= 0:
+                    return last_byte_acked, True
+            if conn_info.state == "CLOSED":
+                raise ConnectionError("Connection đã đóng trước khi hoàn tất gửi")
+            if not unacked:
+                if poll_only:
+                    return last_byte_acked, True
+                raise RuntimeError("Chưa đạt mốc ACK nhưng buffer gửi đã rỗng")
+            if conn_info.timer_deadline is None:
+                raise RuntimeError("Có dữ liệu ACK nhưng chưa có timer")
+
             rto = rtt.rto
             retries = conn_info.retry_count
             deadline = conn_info.timer_deadline
             left = deadline - time.monotonic()
 
+            # slide 84, 146 chapter 3
             if left <= 0:                            # RTO expired
                 # phần xử lý timeout
                 if retries >= MAX_RETRIES:
@@ -1135,9 +1151,12 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq):
                 conn_info.retry_count = retries
                 conn_info.dup_ack_count = 0
                 conn_info.fast_retransmit_pending = False
+
                 rto = min(rto * 2, MAX_RTO)          # next wait is twice as long (exponential backoff)
                 rtt.rto = rto
                 retransmit_oldest("RTO expired")     # RTO trong log là khoảng chờ mới
+                if poll_only:
+                    return last_byte_acked, False
                 continue
             # try:
             #     packet, addr = packet_queue.get(timeout=left)
@@ -1190,11 +1209,16 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq):
             #             retransmit_oldest("3 duplicate ACKs (fast retransmit)")
             #             deadline = time.time() + rto
 
+            # slide 88 chapter 3
             # trách nhiệm xử lý ACK đã được chuyển sang hàm on_ack()
             if conn_info.fast_retransmit_pending:
                 conn_info.fast_retransmit_pending = False
                 retransmit_oldest("3 duplicate ACKs cần fast retransmit")
+                if poll_only:
+                    return last_byte_acked, False
                 continue
+            if poll_only:
+                return last_byte_acked, False
             conn_info.cv.wait(timeout=left)
             
 def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> int:
@@ -1234,7 +1258,7 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
 
         # server_seq dùng để biểu diễn sequence dành cho byte dữ liệu mới tiếp theo (chapter 3 tương ứng với NextSeqNum)
         for chunk in split_into_segments(payload):  # slide 77 chapter 3 chia dữ liệu theo MSS)
-            # wait_for_ack(s, session, start_seq, None, session.unacked, session.rtt, session.client_seq) # kiểm tra timeout/fast retransmit giữa các segment.
+            wait_for_ack(s, session, start_seq, None, session.unacked, session.rtt, session.client_seq) # kiểm tra timeout/fast retransmit giữa các segment.
             with session.cv:
                 if session.error is not None:
                     return -1
