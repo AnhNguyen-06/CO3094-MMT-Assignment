@@ -1,0 +1,6 @@
+docs/
+*.md
+*.pdf
+__pycache__/
+*.py[cod]
+tests/

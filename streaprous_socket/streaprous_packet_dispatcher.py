@@ -116,12 +116,13 @@ def start_packet_dispatcher(s: socket.socket, listen_port: int):
          socket.socket - raw socket
          listen_port 
     """
-    global _packet_dispatcher_thread, _packet_dispatcher_running
+    global _packet_dispatcher_thread, _packet_dispatcher_running, _current_raw_socket
 
     # Concurrently handle multiple connections
     with _packet_dispatcher_lock:
         if _packet_dispatcher_running:
             return
+        _current_raw_socket = s
         _packet_dispatcher_running = True
         _packet_dispatcher_thread = threading.Thread(
             target=_packet_dispatcher, 
@@ -133,13 +134,17 @@ def start_packet_dispatcher(s: socket.socket, listen_port: int):
         print(f"[Sock_dispatcher] Start dispatching packet for port {listen_port}")
 
 
-def stop_packet_dispatcher():
+def stop_packet_dispatcher(s=None):
     """Stop the running packet.
 
     Args: None
     """
     global _packet_dispatcher_running, _packet_dispatcher_thread
     with _packet_dispatcher_lock:
+        # A failed active open must not stop another socket's dispatcher.
+        # No argument preserves the existing explicit global-stop API.
+        if s is not None and _current_raw_socket is not s:
+            return
         _packet_dispatcher_running = False
     if _packet_dispatcher_thread:
         _packet_dispatcher_thread.join(timeout=2)

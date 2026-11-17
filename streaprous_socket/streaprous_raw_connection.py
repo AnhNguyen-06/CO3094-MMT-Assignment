@@ -25,8 +25,10 @@ import sys
 import threading
 import time
 import queue
+import secrets
 from collections import namedtuple
 import netifaces
+from .streaprous_congestion_control import CubicController
 
 # Import streaprout packet dispatcher functions
 from .streaprous_packet_dispatcher import (
@@ -35,7 +37,6 @@ from .streaprous_packet_dispatcher import (
     get_packet_queue,
     get_ack_queue,
     remove_packet_queue,
-    _packet_dispatcher_lock,
     _SYN_KEY,
 )
 
@@ -56,7 +57,7 @@ conn_struct = namedtuple('conn_struct', [
     # connection by the factory below, never shared as namedtuple defaults.
     'send_base', 'next_seq_num', 'rcv_buffer',
     'rcv_buffer_size', 'last_byte_read', 'peer_rwnd',
-    'cwnd', 'ssthresh', 'ca_state', 'dup_ack_count', 'unacked',
+    'cwnd', 'ssthresh', 'ca_state', 'unacked', 'sender_state',
     'peer_window_seq', 'peer_window_ack'
 ], defaults=(None,) * 11)
 
@@ -72,9 +73,9 @@ def new_connection(**fields):
     fields.setdefault('last_byte_read', ((client_seq - 1) & M32) if client_seq is not None else None)
     fields.setdefault('peer_rwnd', 65535)
     fields.setdefault('cwnd', MSS)
-    fields.setdefault('ssthresh', 65535)  # Initial ssthresh (64 KB illustrative default from Slide 125 Reno FSM)
+    fields.setdefault('ssthresh', 65536)  # Group policy: 64 KiB initial threshold (slide FSM example)
     fields.setdefault('ca_state', 'SLOW_START')
-    fields.setdefault('dup_ack_count', 0)
+    fields.setdefault('sender_state', SenderState())
     fields.setdefault('unacked', {})
     fields.setdefault('peer_window_seq', None)
     fields.setdefault('peer_window_ack', None)
@@ -91,13 +92,6 @@ connections_lock = threading.Lock()
 _receive_workers = {}
 _receive_events = {}
 _receive_workers_lock = threading.Lock()
-
-# Management structure to serialize the 3-way handshake
-# Each hand shake is manage by a unique ID client_key
-# including client_ip client_port
-handshake_lock = threading.Lock()
-handshake_in_progress = {}
-
 
 # Default raw port listener
 DEFAULT_LISTEN_IP = "0.0.0.0"
@@ -152,6 +146,32 @@ class RttEstimator:
             self.dev = (1 - BETA) * self.dev + BETA * abs(sample - self.est)
             self.est = (1 - ALPHA) * self.est + ALPHA * sample
         self.rto = min(max(self.est + 4 * self.dev, MIN_RTO), MAX_RTO)
+
+
+class SenderState:
+    """Reliability state owned by one connection, across ACK waits and sends.
+
+    Slide 81-88: RTT estimator, timer for oldest unACKed data, duplicate ACKs.
+    No congestion window algorithm is implemented by this state container.
+    """
+    def __init__(self):
+        self.rtt = RttEstimator()
+        self.rto = self.rtt.rto
+        self.deadline = None
+        self.retries = 0
+        self.dup_count = 0
+        self.probe_deadline = None
+        # Serialize application sends; receiver uses its own transport thread.
+        self.send_lock = threading.Lock()
+        self.cc = CubicController(MSS)
+        # Probe sequence bytes are excluded from ACK-based cwnd growth.
+        self.probe_bytes = set()
+        self.recover = None       # exclusive end of flight at fast recovery entry
+        self.recovery_guard = None  # prevents repeated reductions for old flight
+        self.partial_ack_seen = False
+        # Active open only: (peer SYN sequence, ACK of our SYN), for a lost
+        # final ACK. This is handshake identity, not another receive cursor.
+        self.handshake_ack = None
 
 
 def register_keep_port_alive(listen_ip="0.0.0.0", listen_port=22239, retry_interval=10):
@@ -528,290 +548,152 @@ def get_interface_ip(interface_name: str = None) -> str:
         return "127.0.0.1"
 
 
+def _handshake_header(packet, local_ip, local_port, peer_ip=None, peer_port=None):
+    """Validate the IPv4/TCP header and endpoint tuple before handshake state."""
+    if not verify_tcp_checksum(packet):
+        return None
+    ihl = (packet[0] & 0x0f) * 4
+    total = struct.unpack('!H', packet[2:4])[0]
+    tcp = packet[ihl:total]
+    header = struct.unpack('!HHLLBBHHH', tcp[:20])
+    offset = (header[4] >> 4) * 4
+    if offset < 20 or offset > len(tcp) or header[1] != local_port:
+        return None
+    if packet[16:20] != socket.inet_aton(local_ip):
+        return None
+    if peer_ip is not None and packet[12:16] != socket.inet_aton(peer_ip):
+        return None
+    if peer_port is not None and header[0] != peer_port:
+        return None
+    return header
+
+
+def _wait_handshake(s, session, syn_packet):
+    """Retransmit the same SYN/SYN-ACK; unrelated packets never reset the timer.
+
+    Slide 101: SYN consumes one sequence number; ACK alone consumes none.
+    Retry/backoff uses existing project RTO limits, independently of CUBIC.
+    """
+    key = (session.client_ip, session.client_port)
+    q = get_packet_queue(key)
+    active_open = session.state == "SYN_SENT"
+    rto, retries = INITIAL_RTO, 0
+    s.sendto(syn_packet, (session.client_ip, 0))
+    deadline = time.monotonic() + rto
+    while True:
+        with connections_lock:
+            current = connections.get(key)
+            if current is None or current.sender_state is not session.sender_state:
+                raise ConnectionError("handshake session replaced")
+        left = deadline - time.monotonic()
+        if left <= 0:
+            if retries >= MAX_RETRIES:
+                raise TimeoutError("handshake retries exhausted")
+            retries += 1
+            s.sendto(syn_packet, (session.client_ip, 0))
+            rto = min(rto * 2, MAX_RTO)
+            deadline = time.monotonic() + rto
+            continue
+        try:
+            packet, _ = q.get(timeout=min(left, .2))
+        except queue.Empty:
+            continue
+        # A queued packet must not mutate a replacement session after waiting.
+        with connections_lock:
+            current = connections.get(key)
+            if current is None or current.sender_state is not session.sender_state:
+                raise ConnectionError("handshake session replaced")
+        header = _handshake_header(packet, session.server_ip, session.server_port,
+                                   session.client_ip, session.client_port)
+        if header is None:
+            continue
+        seq, ack, flags = header[2], header[3], header[5]
+        if flags & 0x04:
+            if ((active_open and flags & 0x10 and ack == session.expected_final_ack)
+                    or (not active_open and seq == session.client_seq)):
+                raise ConnectionRefusedError("peer reset handshake")
+            continue
+        if active_open:
+            if flags & 0x17 == 0x12 and ack == session.expected_final_ack:
+                return packet, header
+        else:
+            if flags & 0x17 == 0x02 and seq == ((session.client_seq - 1) & M32):
+                # Duplicate SYN belongs to this pending open. Keep both ISNs;
+                # resend SYN-ACK without extending its retransmission deadline.
+                s.sendto(syn_packet, (session.client_ip, 0))
+            elif (flags & 0x17 == 0x10 and ack == session.expected_final_ack
+                    and seq == session.client_seq):
+                return packet, header
+
+
 def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: str = None) -> conn_struct:
-    """
-    Accept a new connection by performing the 3-way handshake using raw sockets.
-    Returns a conn_struct tuple for the established connection.
-    Handshakes are serialized to ensure only one 3-way handshake is processed at a time.
-    
-    Args:
-        s: Raw socket
-        listen_ip: Server IP to listen on (e.g., '0.0.0.0')
-        listen_port: Server port to listen on
-        interface_name: Network interface name for sending packets (optional)
-    
-    Returns:
-        conn_struct: Established connection information
-    """
-    # Start packet dispatcher for this port
+    """Accept serialized three-way handshakes with SYN-ACK retransmission."""
     start_packet_dispatcher(s, listen_port)
-    
-    # Get actual source IP for sending packets
-    if listen_ip == "0.0.0.0":
-        send_ip = get_interface_ip(interface_name)
-        print(f"[Streap_raw] accept: listen_ip=0.0.0.0, using send_ip={send_ip} for outgoing packets")
-    else:
-        send_ip = listen_ip
-    
-    server_seq = 2000
-    client_ip = None
-    client_port = None
-
-    print(f"[Streap_raw] accept: Waiting for incoming connections on {listen_ip}:{listen_port} (send_ip={send_ip})...")
-    try:
-        while True:
-            # Get packet from dispatcher queue (for SYN packets)
-            syn_q = get_packet_queue(_SYN_KEY)
-            try:
-                packet, addr = syn_q.get(timeout=1.0)
-                print(f"[Streap_raw] accept: Got packet from SYN queue")
-            except queue.Empty:
+    syn_q = get_packet_queue(_SYN_KEY)
+    while True:
+        try:
+            packet, _ = syn_q.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        # With wildcard listen, reply from the actual destination of this SYN.
+        if len(packet) < 20:
+            continue
+        send_ip = socket.inet_ntoa(packet[16:20]) if listen_ip == "0.0.0.0" else listen_ip
+        header = _handshake_header(packet, send_ip, listen_port)
+        if header is None or header[5] & 0x17 != 0x02:
+            continue
+        peer_ip, peer_port = socket.inet_ntoa(packet[12:16]), header[0]
+        key = (peer_ip, peer_port)
+        # SYN payload / TCP Fast Open is outside the assignment's handshake.
+        total = struct.unpack('!H', packet[2:4])[0]
+        if total != (packet[0] & 0x0f) * 4 + (header[4] >> 4) * 4:
+            continue
+        isn = secrets.randbits(32)  # Chosen once per attempt, stable on retry.
+        session = new_connection(client_ip=peer_ip, client_port=peer_port,
+            server_ip=send_ip, server_port=listen_port, state="SYN_RCVD",
+            server_seq=isn, client_seq=(header[2] + 1) & M32,
+            expected_final_ack=(isn + 1) & M32, last_activity=time.time(),
+            peer_rwnd=header[6])
+        with connections_lock:
+            if key in connections:
                 continue
-
-            # Check for valid packets
-            if not verify_tcp_checksum(packet):
-                continue
-
-            # Extract IP Header Length
-            ihl = (packet[0] & 0x0F) * 4
-            tcp_packet = packet[ihl:]
-            
-            if len(tcp_packet) < 20:
-                continue
-
-            # Unpack the received TCP header
-            tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
-            src_port, dest_port, pkt_seq, pkt_ack, flags = (
-                tcph[0],
-                tcph[1],
-                tcph[2],
-                tcph[3],
-                tcph[5],
-            )
-
-            # Bypass non-listen port
-            if dest_port != listen_port:
-                continue
-
-            syn_flag = (flags & 0x02) >> 1
-            ack_flag = (flags & 0x10) >> 4
-
-            # Build client_key from client IP and client port
-            client_ip = socket.inet_ntoa(packet[12:16])
-            client_port = src_port
-            client_key = (client_ip, client_port)
-            print(f"\n[Streap_raw] accept: Receiv packet from Client ({client_ip}:{client_port}) (Seq={pkt_seq}, SYN={syn_flag}, ACK={ack_flag})")
-
-            # Create queue for each connection associated 
-            # with tupple client_key=(client_ip, client_port)
-            q = get_packet_queue(client_key)
-            print(f"[Streap_raw] accept: Createet per-connection queue for {client_key}")
+            connections[key] = session
+        get_packet_queue(key)  # Register before sending SYN-ACK.
+        tcp = build_tcp_packet(send_ip, peer_ip, listen_port, peer_port,
+            seq=isn, ack_seq=session.client_seq, syn=1, ack=1,
+            window=get_current_rwnd(session))
+        syn_ack = build_ip_header(send_ip, peer_ip, socket.IPPROTO_TCP, len(tcp)) + tcp
+        try:
+            final_packet, final_header = _wait_handshake(s, session, syn_ack)
             with connections_lock:
-                # Declare initialized session if not available
-                if client_key not in connections:
-                    connections[client_key] = new_connection(
-                        client_ip=client_ip,
-                        client_port=client_port,
-                        server_ip=send_ip,
-                        server_port=listen_port,
-                        state="LISTEN",
-                        server_seq=2000,
-                        client_seq=0,
-                        expected_final_ack=0,
-                        last_activity=time.time()
-                    )
-                session = connections[client_key]
-
-                        
-            # Perform 3 handshake step
-            # STEP 1: Obtain client SYN 
-            if syn_flag == 1 and ack_flag == 0:
-                print(f"\nHandshake1: Received SYN from Client ({client_ip}:{client_port}) (Seq={pkt_seq})")
-
-                # Quick duplicate handshake check (fast, no heavy operations)
-                with handshake_lock:
-                    if handshake_in_progress.get(client_key, False):
-                        print(f"[Streap_raw] accept: Handshake already in progress for {client_ip}:{client_port}, dropping SYN")
-                        continue
-                    handshake_in_progress[client_key] = True
-
-                # STEP 2: Reply SYN-ACK immediately
-                # Build TCP packet for SYN-ACK
-                next_ack = pkt_seq + 1
-                syn_ack_packet = build_tcp_packet(send_ip, client_ip, listen_port, client_port,
-                                                  seq=server_seq, ack_seq=next_ack, syn=1, ack=1)
-                ip_header = build_ip_header(send_ip, client_ip, socket.IPPROTO_TCP, len(syn_ack_packet))
-                full_packet = ip_header + syn_ack_packet
-
-                # Send SYN-ACK packet
-                print(f"[Streap_raw] accept: Sending SYN-ACK to {client_ip}:{client_port} from {send_ip}:{listen_port}")
-                print(f"[Streap_raw] accept: SYN-ACK packet size: {len(full_packet)} bytes (IP={len(ip_header)}, TCP={len(syn_ack_packet)})")
-                bytes_sent = s.sendto(full_packet, (client_ip, 0))
-                print(f"Handshake2: Sent SYN-ACK to Client (Seq={server_seq}, Ack={next_ack}, bytes_sent={bytes_sent})")
-
-                # Register connection to the associated queue for each connection associated 
-                # with tupple client_key=(client_ip, client_port)
-                with connections_lock:
-                    connections[client_key] = new_connection(
-                        client_ip=client_ip,
-                        client_port=client_port,
-                        server_ip=send_ip,  # Use actual sending IP
-                        server_port=listen_port,
-                        state="SYN_RCVD",
-                        server_seq=server_seq,
-                        client_seq=pkt_seq,
-                        expected_final_ack=server_seq + 1,
-                        last_activity=time.time(),
-                        peer_rwnd=tcph[6],
-                    )
-                    session = connections[client_key]
-
-                # STEP 3: Wait for client FIN-ACK
-                # The final ACK will arrive on the per-connection queue, not the SYN queue
-                deadline = time.time() + 10.0
-                while time.time() < deadline:
-                    try:
-                        packet, addr = q.get(timeout=0.5)
-                        print(f"[Streap_raw] accept: Got packet from per-connection queue for {client_ip}:{client_port}")
-                    except queue.Empty:
-                        print(f"[Streap_raw] accept: Per-connection queue empty for {client_ip}:{client_port}, waiting...")
-                        continue
-
-                    # Verify receivd packet
-                    if not verify_tcp_checksum(packet):
-                        continue
-
-                    # Extract IP Header Length
-                    ihl = (packet[0] & 0x0F) * 4
-                    tcp_packet = packet[ihl:]
-                    
-                    if len(tcp_packet) < 20:
-                        continue
-
-                    # Unpack the received TCP header
-                    tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
-                    src_port, dest_port, pkt_seq, pkt_ack, flags = (
-                        tcph[0],
-                        tcph[1],
-                        tcph[2],
-                        tcph[3],
-                        tcph[5],
-                    )
-
-                    syn_flag = (flags & 0x02) >> 1
-                    ack_flag = (flags & 0x10) >> 4
-                    print(f"[Streap_raw] accept: Received packet in handshake wait - SYN={syn_flag}, ACK={ack_flag}, Seq={pkt_seq}, Ack={pkt_ack}")
-
-                    # Check if this is the final ACK (ACK only, no SYN) and matches expected ACK number (Slide 101)
-                    expected_client_seq = (session.client_seq + 1) & M32
-                    if (syn_flag == 0 and ack_flag == 1
-                            and pkt_ack == session.expected_final_ack
-                            and pkt_seq == expected_client_seq):
-                        print(f"[Streap_raw] accept: handshake3 Received FIN-ACK from Client (Seq={pkt_seq}, Ack={pkt_ack})")
-
-                        with connections_lock:
-                            if session.state != "SYN_RCVD":
-                                print(f"[Streap_raw] accept: Non handshake state for {client_ip}:{client_port}")
-                                break
-
-                            # Update connection to ESTABLISHED
-                            connections[client_key] = new_connection(
-                                client_ip=client_ip,
-                                client_port=client_port,
-                                server_ip=send_ip,
-                                server_port=listen_port,
-                                state="ESTABLISHED",
-                                server_seq=pkt_ack,
-                                client_seq=pkt_seq,
-                                expected_final_ack=session.expected_final_ack,
-                                last_activity=time.time(),
-                                peer_rwnd=tcph[6],
-                            )
-                            session = connections[client_key]
-
-                        # Clear handshake in progress flag
-                        with handshake_lock:
-                            handshake_in_progress[client_key] = False
-
-                        print(f"[Streap_raw] Etablished handshak with connection: ({client_ip}:{client_port}) ESTABLISHED")
-                        
-                        start_connection_receiver(s, session)
-                        # Return the established connection info
-                        return session
-                
-                # Fallback of the handshake timeout
-                print(f"[Streap_raw] Handshake timeout for {client_ip}:{client_port}")
-                with handshake_lock:
-                    handshake_in_progress[client_key] = False
-                remove_packet_queue(client_key)
-                with connections_lock:
-                    connections.pop(client_key, None)
-                continue
-
-            # STEP 3 Exception handling: Capture FIN ACK on SYN queue ---
-            expected_client_seq = (session.client_seq + 1) & M32
-            if (session.state == "SYN_RCVD" and syn_flag == 0 and ack_flag == 1
-                    and pkt_ack == session.expected_final_ack
-                    and pkt_seq == expected_client_seq):
-                print(f"[Streap_raw] accept: handshake3 received Final ACK from Client on SYN queue (Seq={pkt_seq}, Ack={pkt_ack})")
-                print(f"[Streap_raw] accept: Fallback - got final ACK on SYN queue for {client_ip}:{client_port}")
-
-                with connections_lock:
-                    if session.state != "SYN_RCVD":
-                        print(f"[Streap_raw] accept: Non handshake state for {client_ip}:{client_port}")
-                        continue
-
-                    # Update connection to ESTABLISHED
-                    connections[client_key] = new_connection(
-                        client_ip=client_ip,
-                        client_port=client_port,
-                        server_ip=send_ip,
-                        server_port=listen_port,
-                        state="ESTABLISHED",
-                        server_seq=pkt_ack,
-                        client_seq=pkt_seq,
-                        expected_final_ack=session.expected_final_ack,
-                        last_activity=time.time(),
-                        peer_rwnd=tcph[6],
-                    )
-                    session = connections[client_key]
-
-                # Clear handshake in progress flag
-                with handshake_lock:
-                    handshake_in_progress[client_key] = False
-
-                print(f"[Streap_raw] Etablished handshak with connection: ({client_ip}:{client_port}) ESTABLISHED")
-                
-                start_connection_receiver(s, session)
-                # Return the established connection info
-                return session
-
-    except KeyboardInterrupt:
-        print("\n[-] Server stopped.")
-        # Clear handshake flags on interrupt
-        with handshake_lock:
-            handshake_in_progress.clear()
-        raise
+                current = connections.get(key)
+                if current is None or current.sender_state is not session.sender_state:
+                    raise ConnectionError("handshake session replaced")
+                session = current._replace(state="ESTABLISHED",
+                    server_seq=current.expected_final_ack,
+                    send_base=current.expected_final_ack, next_seq_num=current.expected_final_ack,
+                    peer_rwnd=final_header[6], peer_window_seq=final_header[2],
+                    peer_window_ack=final_header[3], last_activity=time.time())
+                connections[key] = session
+            # Hand off the consumed final segment directly: queue.put() could
+            # reorder it or fail on a full queue. Receiver handles its payload
+            # through the same bounded buffer/reassembly path exactly once.
+            start_connection_receiver(s, session, initial_packet=final_packet)
+            return session
+        except (OSError, ConnectionError) as exc:
+            print(f"[Streap_raw] accept: handshake failed for {key}: {exc}")
+            with connections_lock:
+                current = connections.get(key)
+                if current is not None and current.sender_state is session.sender_state:
+                    connections.pop(key)
+                    remove_packet_queue(key)
 
 
 def raw_connect(dest_ip: str, dest_port: int, client_port: int = None, interface_name: str = None):
-    """
-    Establish a new connection to a remote host using TCP 3-way handshake over raw sockets (Slide 101).
-    
-    Args:
-        dest_ip: Destination server IPv4 address
-        dest_port: Destination server port
-        client_port: Local port to bind and listen on (if None, picks an ephemeral port)
-        interface_name: Local network interface (optional)
-        
-    Returns:
-        tuple: (conn_struct for the established connection, raw socket object) or (None, None)
-    """
+    """Active open: retry SYN, validate SYN-ACK, then acknowledge the peer SYN."""
     import random
-    
     s = create_raw_socket()
     send_ip = get_interface_ip(interface_name)
-    
     if client_port is None:
         while True:
             candidate = random.randint(49152, 65530)
@@ -819,116 +701,62 @@ def raw_connect(dest_ip: str, dest_port: int, client_port: int = None, interface
                 if not any(conn.server_port == candidate for conn in connections.values()):
                     client_port = candidate
                     break
-
-    remote_key = (dest_ip, dest_port)
-    print(f"[Streap_raw] raw_connect: Connecting to {dest_ip}:{dest_port} from {send_ip}:{client_port}...")
-    
-    # Start packet dispatcher for incoming packets destined to client_port
+    key = (dest_ip, dest_port)
+    isn = secrets.randbits(32)
+    session = new_connection(client_ip=dest_ip, client_port=dest_port,
+        server_ip=send_ip, server_port=client_port, state="SYN_SENT",
+        server_seq=isn, client_seq=0, expected_final_ack=(isn + 1) & M32,
+        last_activity=time.time())
+    with connections_lock:
+        if key in connections:
+            s.close()
+            raise ConnectionError("peer key already in use")
+        connections[key] = session
+    get_packet_queue(key)
     start_packet_dispatcher(s, client_port)
-    
-    # Pre-register packet queue for remote_key = (dest_ip, dest_port)
-    q = get_packet_queue(remote_key)
-    
-    client_isn = random.randint(1000, 100000)
-    
-    # STEP 1: Send SYN packet (Slide 101: SYNbit=1, Seq=x)
-    syn_packet = build_tcp_packet(send_ip, dest_ip, client_port, dest_port,
-                                  seq=client_isn, ack_seq=0, syn=1, ack=0)
-    ip_header = build_ip_header(send_ip, dest_ip, socket.IPPROTO_TCP, len(syn_packet))
-    full_packet = ip_header + syn_packet
-    
-    with connections_lock:
-        connections[remote_key] = new_connection(
-            client_ip=dest_ip,        # remote peer IP
-            client_port=dest_port,    # remote peer port
-            server_ip=send_ip,        # local IP
-            server_port=client_port,  # local port
-            state="SYN_SENT",
-            server_seq=client_isn,
-            client_seq=0,
-            expected_final_ack=0,
-            last_activity=time.time()
-        )
-    
-    print(f"[Streap_raw] raw_connect: Step 1 -> Sending SYN (Seq={client_isn}) to {dest_ip}:{dest_port}")
-    s.sendto(full_packet, (dest_ip, 0))
-    
-    # STEP 2: Wait for SYN-ACK from server (Slide 101: SYNbit=1, Seq=y, ACKbit=1, ACKnum=x+1)
-    deadline = time.time() + 10.0
-    while time.time() < deadline:
-        try:
-            packet, addr = q.get(timeout=1.0)
-        except queue.Empty:
-            print(f"[Streap_raw] raw_connect: Waiting for SYN-ACK from {dest_ip}:{dest_port}...")
-            continue
-            
-        if not verify_tcp_checksum(packet):
-            print(f"[Streap_raw] raw_connect: Drop corrupted packet (Checksum error)")
-            continue
-            
-        ihl = (packet[0] & 0x0F) * 4
-        tcp_packet = packet[ihl:]
-        if len(tcp_packet) < 20:
-            continue
-            
-        tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
-        src_port, dst_port, pkt_seq, pkt_ack, flags = tcph[0], tcph[1], tcph[2], tcph[3], tcph[5]
-        
-        if src_port != dest_port or dst_port != client_port:
-            continue
-            
-        syn_flag = (flags & 0x02) >> 1
-        ack_flag = (flags & 0x10) >> 4
-        
-        rst_flag = (flags & 0x04) >> 2
-        if syn_flag == 1 and ack_flag == 1 and not rst_flag:
-            expected_ack = (client_isn + 1) & M32
-            if pkt_ack != expected_ack:
-                print(f"[Streap_raw] raw_connect: Unexpected ACK num={pkt_ack}, expected {expected_ack}")
-                continue
-                
-            server_isn = pkt_seq
-            print(f"[Streap_raw] raw_connect: Step 2 -> Received SYN-ACK (Seq={server_isn}, Ack={pkt_ack})")
-            
-            # STEP 3: Send Final ACK (Slide 101: ACKbit=1, ACKnum=y+1)
-            next_client_seq = expected_ack
-            next_server_ack = (server_isn + 1) & M32
-            
-            ack_packet = build_tcp_packet(send_ip, dest_ip, client_port, dest_port,
-                                          seq=next_client_seq, ack_seq=next_server_ack, syn=0, ack=1)
-            ip_header = build_ip_header(send_ip, dest_ip, socket.IPPROTO_TCP, len(ack_packet))
-            s.sendto(ip_header + ack_packet, (dest_ip, 0))
-            print(f"[Streap_raw] raw_connect: Step 3 -> Sent Final ACK (Seq={next_client_seq}, Ack={next_server_ack})")
-            
-            with connections_lock:
-                session = new_connection(
-                    client_ip=dest_ip,        # remote peer IP
-                    client_port=dest_port,    # remote peer port
-                    server_ip=send_ip,        # local IP
-                    server_port=client_port,  # local port
-                    state="ESTABLISHED",
-                    server_seq=next_client_seq, # local sending seq
-                    client_seq=next_server_ack, # remote next expected seq
-                    expected_final_ack=0,
-                    last_activity=time.time(),
-                    peer_rwnd=tcph[6],
-                )
-                connections[remote_key] = session
-                
-            start_connection_receiver(s, session)
-            print(f"[Streap_raw] raw_connect: Connection ESTABLISHED with {dest_ip}:{dest_port}")
-            return session, s
-            
-    print(f"[Streap_raw] raw_connect: Handshake timeout waiting for SYN-ACK from {dest_ip}:{dest_port}")
-    remove_packet_queue(remote_key)
-    with connections_lock:
-        connections.pop(remote_key, None)
-    stop_packet_dispatcher()
-    s.close()
-    return None, None
+    tcp = build_tcp_packet(send_ip, dest_ip, client_port, dest_port,
+        seq=isn, ack_seq=0, syn=1, window=get_current_rwnd(session))
+    syn = build_ip_header(send_ip, dest_ip, socket.IPPROTO_TCP, len(tcp)) + tcp
+    try:
+        syn_ack, header = _wait_handshake(s, session, syn)
+        # SYN payload / Fast Open is not supported; never silently discard it.
+        total = struct.unpack('!H', syn_ack[2:4])[0]
+        if total != (syn_ack[0] & 0x0f) * 4 + (header[4] >> 4) * 4:
+            raise ConnectionError("SYN payload is unsupported")
+        with connections_lock:
+            current = connections.get(key)
+            if current is None or current.sender_state is not session.sender_state:
+                raise ConnectionError("handshake session replaced")
+            session = current._replace(state="ESTABLISHED", server_seq=(isn + 1) & M32,
+                send_base=(isn + 1) & M32, next_seq_num=(isn + 1) & M32,
+                client_seq=(header[2] + 1) & M32, last_byte_read=header[2],
+                peer_rwnd=header[6], peer_window_seq=header[2], peer_window_ack=header[3],
+                last_activity=time.time())
+            session.sender_state.handshake_ack = (header[2], header[3])
+            connections[key] = session
+        tcp = build_tcp_packet(send_ip, dest_ip, client_port, dest_port,
+            seq=session.server_seq, ack_seq=session.client_seq, ack=1,
+            window=get_current_rwnd(session))
+        s.sendto(build_ip_header(send_ip, dest_ip, socket.IPPROTO_TCP, len(tcp)) + tcp,
+                 (dest_ip, 0))
+        start_connection_receiver(s, session)
+        return session, s
+    except (OSError, ConnectionError) as exc:
+        print(f"[Streap_raw] raw_connect: handshake failed for {key}: {exc}")
+        owns_session = False
+        with connections_lock:
+            current = connections.get(key)
+            if current is not None and current.sender_state is session.sender_state:
+                owns_session = True
+                connections.pop(key)
+                remove_packet_queue(key)
+        if owns_session:
+            stop_packet_dispatcher(s)
+            s.close()
+        return None, None
 
 
-def start_connection_receiver(s: socket.socket, conn_info: conn_struct):
+def start_connection_receiver(s: socket.socket, conn_info: conn_struct, initial_packet=None):
     """Start transport-side packet processing independently of application reads.
 
     Buffering and ACK/window advertisement continue while the application is
@@ -942,7 +770,7 @@ def start_connection_receiver(s: socket.socket, conn_info: conn_struct):
         _receive_events[key] = threading.Event()
         worker = threading.Thread(
             target=_run_conn_receive_loop,
-            args=(s, conn_info),
+            args=(s, conn_info, initial_packet),
             daemon=True,
             name=f"tcp-recv-{conn_info.client_ip}-{conn_info.client_port}",
         )
@@ -1006,7 +834,7 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct, max_bytes: int = Non
         event.clear()
 
 
-def _run_conn_receive_loop(s: socket.socket, conn_info: conn_struct) -> None:
+def _run_conn_receive_loop(s: socket.socket, conn_info: conn_struct, initial_packet=None) -> None:
     """
     Transport-side receive loop: validate, buffer, and ACK packets continuously.
     It deliberately does not remove payload bytes; only the application read
@@ -1036,14 +864,25 @@ def _run_conn_receive_loop(s: socket.socket, conn_info: conn_struct) -> None:
                 if client_key not in connections or _receive_events.get(client_key) is not receive_event:
                     return
             # Get packet from the dispatcher queue instead of reading directly from socket
-            try:
-                packet, addr = packet_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
+            if initial_packet is not None:
+                packet, initial_packet = initial_packet, None
+            else:
+                try:
+                    packet, addr = packet_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+            with connections_lock:
+                session = connections.get(client_key)
+                if (session is None or session.sender_state is not conn_info.sender_state
+                        or _receive_events.get(client_key) is not receive_event):
+                    return
 
             # Every time received a packet, verify checksum
             if not verify_tcp_checksum(packet):
                 continue
+            # IP padding is not TCP application data (including a final ACK
+            # handed off from the handshake).
+            packet = packet[:struct.unpack('!H', packet[2:4])[0]]
 
             # Extract IP Header Length
             ihl = (packet[0] & 0x0F) * 4
@@ -1068,7 +907,9 @@ def _run_conn_receive_loop(s: socket.socket, conn_info: conn_struct) -> None:
                 continue
 
             # Check if this packet is for our connection
-            if src_port != client_port:
+            if (src_port != client_port
+                    or packet[12:16] != socket.inet_aton(client_ip)
+                    or packet[16:20] != socket.inet_aton(listen_ip)):
                 continue
             
             syn_flag = (flags & 0x02) >> 1
@@ -1088,7 +929,25 @@ def _run_conn_receive_loop(s: socket.socket, conn_info: conn_struct) -> None:
                     if session is not None:
                         connections[client_key] = session._replace(state="RESET")
                 return
-            if syn_flag or not ack_flag:
+            if syn_flag:
+                # Lost final ACK: the server retransmits its original SYN-ACK.
+                # Do not consume SYN again or overwrite current data cursors.
+                with connections_lock:
+                    session = connections.get(client_key)
+                    if (session is None or session.sender_state is not conn_info.sender_state
+                            or _receive_events.get(client_key) is not receive_event):
+                        return
+                    if (session.state != "ESTABLISHED" or flags & 0x17 != 0x12
+                            or session.sender_state.handshake_ack != (pkt_seq, pkt_ack)
+                            or len(tcp_packet) != tcp_header_len):
+                        continue
+                    response = build_tcp_packet(listen_ip, client_ip, listen_port, client_port,
+                        seq=session.server_seq, ack_seq=session.client_seq, ack=1,
+                        window=get_current_rwnd(session))
+                s.sendto(build_ip_header(listen_ip, client_ip, socket.IPPROTO_TCP,
+                         len(response)) + response, (client_ip, 0))
+                continue
+            if not ack_flag:
                 continue
             with connections_lock:
                 session = connections.get(client_key)
@@ -1202,13 +1061,14 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq, return_on_u
 
     client_key = (conn_info.client_ip, conn_info.client_port)
     packet_queue = get_ack_queue(client_key)
-    rto = rtt.rto
-    retries = 0
-    dup_count = 0
-    deadline = time.time() + rto
-    # Textbook 3.5.5 (p.248): probe zero windows with one data byte.
-    # Fixed 1 second is the group's simulation policy, not a textbook/RFC timer.
-    probe_deadline = time.monotonic() + 1.0
+    with connections_lock:
+        state = connections[client_key].sender_state
+    # Retain the public helper signature; the connection owns the estimator.
+    rtt = state.rtt
+    if unacked and state.deadline is None:
+        state.deadline = time.monotonic() + state.rto
+    if state.probe_deadline is None:
+        state.probe_deadline = time.monotonic() + 1.0
 
     def retransmit_oldest(reason):
         seg_seq = min(unacked, key=lambda seq: seq_diff(seq, start))
@@ -1222,18 +1082,23 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq, return_on_u
             seq=seg_seq, ack_seq=session.client_seq, payload=seg_chunk,
             window=cur_rwnd
         )
-        unacked[seg_seq] = (seg_chunk, time.time(), True)   # True = already retransmitted
+        unacked[seg_seq] = (seg_chunk, time.monotonic(), True)   # True = already retransmitted
         print(f"[Streap_raw] wait_for_ack: RETRANSMIT seq={seg_seq} ({len(seg_chunk)} bytes), "
-              f"reason: {reason}, RTO={rto*1000:.0f} ms, attempt {retries}")
+              f"reason: {reason}, RTO={state.rto*1000:.0f} ms, attempt {state.retries}")
 
     while True:
         with connections_lock:
             session = connections.get(client_key)
-            if session is None or session.state in ("CLOSED", "RESET", "ERROR"):
+            if (session is None or session.sender_state is not state
+                    or session.state in ("CLOSED", "RESET", "ERROR")):
                 raise ConnectionError("connection closed while waiting for ACK/window")
             zero_window = session.peer_rwnd == 0
+            # RFC 9438 5.8: receiver-limited time is excluded even before
+            # the first persist probe. An open window alone cannot resume CA.
+            state.cc.update_clock(time.monotonic(),
+                session.peer_rwnd >= session.cwnd)
         if zero_window:
-            if time.monotonic() >= probe_deadline:
+            if time.monotonic() >= state.probe_deadline:
                 if unacked:
                     probe_seq = min(unacked, key=lambda seq: seq_diff(seq, start))
                     chunk, sent_at, _ = unacked[probe_seq]
@@ -1241,7 +1106,7 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq, return_on_u
                     unacked[probe_seq] = (chunk, sent_at, True)
                 elif probe_data:
                     probe_seq, probe_byte = target, probe_data[:1]
-                    unacked[probe_seq] = (probe_byte, time.time(), True)
+                    unacked[probe_seq] = (probe_byte, time.monotonic(), True)
                     target = (target + 1) & M32
                     last_byte_sent = (target - 1) & M32
                     with connections_lock:
@@ -1250,6 +1115,7 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq, return_on_u
                 else:
                     probe_byte = b""
                 if probe_byte:
+                    state.probe_bytes.add(probe_seq)
                     with connections_lock:
                         session = connections[client_key]
                         probe_window = get_current_rwnd(session)
@@ -1258,26 +1124,46 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq, return_on_u
                         conn_info.server_port, conn_info.client_port,
                         seq=probe_seq, ack_seq=session.client_seq,
                         payload=probe_byte, window=probe_window)
-                probe_deadline = time.monotonic() + 1.0
+                state.probe_deadline = time.monotonic() + 1.0
             # Persist waits do not exhaust data-loss retries or trigger fast
             # retransmit. Poll close/error state even when the peer is silent.
-            left = min(0.2, max(0.001, probe_deadline - time.monotonic()))
-            deadline = time.time() + rto
+            left = min(0.2, max(0.001, state.probe_deadline - time.monotonic()))
+            # Suspend data-loss timer during persist; reopening restarts it.
+            state.deadline = None
         else:
-            left = min(0.2, deadline - time.time())
+            if unacked and state.deadline is None:
+                state.deadline = time.monotonic() + state.rto
+            left = min(0.2, state.deadline - time.monotonic()) if unacked else 0.2
         if not unacked and not zero_window:
             left = 0.2
         if left <= 0:                            # RTO expired
-            if retries >= MAX_RETRIES:
-                print(f"[Streap_raw] wait_for_ack: GIVE UP after {retries} retransmissions, last_byte_acked={last_byte_acked}")
+            if state.retries >= MAX_RETRIES:
+                print(f"[Streap_raw] wait_for_ack: GIVE UP after {state.retries} retransmissions, last_byte_acked={last_byte_acked}")
                 if return_on_update:
                     raise TimeoutError("peer did not acknowledge outstanding data")
                 return last_byte_acked, False
-            retries += 1
+            with connections_lock:
+                session = connections[client_key]
+                if state.retries == 0:
+                    new_cwnd, threshold = state.cc.on_loss(
+                        session.cwnd, seq_diff(target, (last_byte_acked + 1) & M32),
+                        time.monotonic(), timeout=True)
+                else:
+                    # Same segment timing out again: keep threshold/backoff.
+                    new_cwnd, threshold = state.cc.mss, session.ssthresh
+                connections[client_key] = session._replace(
+                    cwnd=new_cwnd, ssthresh=threshold, ca_state="SLOW_START")
+                state.recover = None
+                state.recovery_guard = target
+                state.partial_ack_seen = False
+            print(f"[CUBIC] event=RTO connection={client_key} "
+                  f"cwnd={session.cwnd:.3f}->{new_cwnd:.3f} "
+                  f"ssthresh={threshold:.3f} phase=SLOW_START")
+            state.retries += 1
             retransmit_oldest("RTO expired")     # the log shows the RTO that just expired
-            rto = min(rto * 2, MAX_RTO)          # next wait is twice as long (exponential backoff)
-            dup_count = 0
-            deadline = time.time() + rto
+            state.rto = min(state.rto * 2, MAX_RTO)          # next wait is twice as long (exponential backoff)
+            state.dup_count = 0
+            state.deadline = time.monotonic() + state.rto
             continue
         try:
             packet, addr = packet_queue.get(timeout=left)
@@ -1309,7 +1195,7 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq, return_on_u
             continue
         if packet[12:16] != socket.inet_aton(conn_info.client_ip) or packet[16:20] != socket.inet_aton(conn_info.server_ip):
             continue
-        if seq_diff(pkt_ack, start) < 0 or seq_diff(pkt_ack, target) > 0:
+        if seq_diff(pkt_ack, (last_byte_acked + 1) & M32) < 0 or seq_diff(pkt_ack, target) > 0:
             continue                            # ACK cannot acknowledge unsent bytes
 
         # Flow Control: Update peer_rwnd from advertised window in TCP header (Slide 94-95)
@@ -1331,15 +1217,34 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq, return_on_u
                     peer_window_ack=pkt_ack)
             else:
                 window_size = old_window
+            state.cc.update_clock(time.monotonic(),
+                window_size >= session.cwnd)
             if old_window != 0 and window_size == 0:
-                probe_deadline = time.monotonic() + 1.0
+                state.probe_deadline = time.monotonic() + 1.0
 
+        if pkt_ack == ((last_byte_acked + 1) & M32) and not fresh_window:
+            continue  # stale SEQ/window metadata is not a fresh loss indication
         new_last = (pkt_ack - 1) & M32           # ACK number = next byte expected, so last byte received = ACK - 1
         if seq_diff(new_last, last_byte_acked) > 0:          # NEW ACK: advance
+            ack_start = (last_byte_acked + 1) & M32
+            newly_acked = seq_diff(pkt_ack, ack_start)
+            probe_acked = {seq for seq in state.probe_bytes
+                if 0 <= seq_diff(seq, ack_start) < newly_acked}
+            state.probe_bytes.difference_update(probe_acked)
+            with connections_lock:
+                session = connections[client_key]
+                cwnd = session.cwnd
+                inflight_before_ack = seq_diff(target, ack_start)
+                eligible = (not zero_window and min(old_window, window_size) >= cwnd
+                    and inflight_before_ack >= int(cwnd)
+                    and not probe_acked and state.retries == 0)
             last_byte_acked = new_last
             newest_sent_at = None
+            acknowledged_retransmission = False
             for seg_seq in list(unacked):
                 seg_chunk, seg_sent_at, was_retx = unacked[seg_seq]
+                if was_retx and seq_diff(pkt_ack, seg_seq) > 0:
+                    acknowledged_retransmission = True
                 seg_last_byte = (seg_seq + len(seg_chunk) - 1) & M32     # last byte of the segment
                 if seq_diff(last_byte_acked, seg_last_byte) >= 0:
                     del unacked[seg_seq]
@@ -1349,39 +1254,121 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq, return_on_u
                     # A cumulative ACK may cover only a prefix of a segment.
                     del unacked[seg_seq]
                     unacked[pkt_ack] = (seg_chunk[seq_diff(pkt_ack, seg_seq):], seg_sent_at, was_retx)
+            # An ACK covering any retransmitted bytes is ambiguous (Karn),
+            # even if it cumulatively covers some original transmissions too.
+            if acknowledged_retransmission:
+                newest_sent_at = None
             if newest_sent_at is not None:
-                sample = time.time() - newest_sent_at
+                sample = time.monotonic() - newest_sent_at
                 rtt.update(sample)
                 print(f"[Streap_raw] wait_for_ack: RTT sample={sample*1000:.1f} ms, "
                       f"Est={rtt.est*1000:.1f} ms, Dev={rtt.dev*1000:.1f} ms, RTO={rtt.rto*1000:.1f} ms")
             print(f"[Streap_raw] wait_for_ack: ACK={pkt_ack} (last_byte_acked={last_byte_acked}, "
                   f"{seq_diff(last_byte_sent, last_byte_acked)} bytes remaining, {len(unacked)} unacked segments)")
+            # Commit progress before any return_on_update exit. Window-only
+            # updates below must not restart this timer or clear loss retries.
+            state.retries = 0
+            state.dup_count = 0
+            if newest_sent_at is not None:
+                state.rto = rtt.rto
+            partial_recovery = (state.recover is not None
+                and seq_diff(pkt_ack, state.recover) < 0)
+            if not partial_recovery or not state.partial_ack_seen:
+                state.deadline = time.monotonic() + state.rto if unacked else None
+            with connections_lock:
+                session = connections[client_key]
+                if state.recover is not None:
+                    if partial_recovery:
+                        # NewReno (no SACK): one repair per partial ACK; do not
+                        # reduce ssthresh/W_max again within this recovery flight.
+                        updated_cwnd = max(state.cc.mss,
+                            session.cwnd - newly_acked
+                            + (state.cc.mss if newly_acked >= state.cc.mss else 0))
+                        phase = "FAST_RECOVERY"
+                        state.partial_ack_seen = True
+                    else:
+                        updated_cwnd = session.ssthresh
+                        state.recover = None
+                        phase = "CONGESTION_AVOIDANCE"
+                    state.cc.pause(time.monotonic())
+                else:
+                    updated_cwnd = state.cc.on_ack(
+                        session.cwnd, session.ssthresh, newly_acked,
+                        rtt.est, time.monotonic(), eligible and not acknowledged_retransmission)
+                    phase = ("SLOW_START" if updated_cwnd < session.ssthresh
+                             else "CONGESTION_AVOIDANCE")
+                connections[client_key] = session._replace(
+                    send_base=pkt_ack, cwnd=updated_cwnd, ca_state=phase)
+                if not unacked:
+                    state.cc.pause(time.monotonic())
+            print(f"[CUBIC] event=ACK connection={client_key} ack={pkt_ack} "
+                  f"new_bytes={newly_acked} cwnd={session.cwnd:.3f}->{updated_cwnd:.3f} "
+                  f"ssthresh={session.ssthresh:.3f} phase={phase}")
+            if partial_recovery and unacked:
+                retransmit_oldest("partial recovery ACK")
             if seq_diff(last_byte_acked, last_byte_sent) >= 0:
                 return last_byte_acked, True
             if return_on_update:
                 return last_byte_acked, False
-            retries = 0
-            dup_count = 0
-            rto = rtt.rto
-            deadline = time.time() + rto         # progress made: restart the timer
 
         elif new_last == last_byte_acked and window_size != old_window:
             # An unchanged ACK number can advertise newly available space.
             # A window update is not counted as a duplicate loss indication.
             if return_on_update:
                 return last_byte_acked, not unacked
-            dup_count = 0
         elif new_last == last_byte_acked and unacked and not zero_window:        # DUPLICATE ACK
             tcp_hdr_len = ((tcp_packet[12] >> 4) & 0x0F) * 4
             pure_ack = len(tcp_packet) == tcp_hdr_len and not (flags & 0x07)   # no SYN/RST/FIN, no data
             if pure_ack:
-                dup_count += 1
-                print(f"[Streap_raw] wait_for_ack: duplicate ACK #{dup_count} (ack={pkt_ack})")
-                if dup_count == 3:
+                state.dup_count += 1
+                print(f"[Streap_raw] wait_for_ack: duplicate ACK #{state.dup_count} (ack={pkt_ack})")
+                if state.recover is not None:
+                    with connections_lock:
+                        session = connections[client_key]
+                        connections[client_key] = session._replace(
+                            cwnd=session.cwnd + state.cc.mss)
+                    if return_on_update:
+                        return last_byte_acked, False
+                elif (state.dup_count == 3 and
+                      (state.recovery_guard is None or
+                       seq_diff((last_byte_acked + 1) & M32, state.recovery_guard) > 0)):
+                    with connections_lock:
+                        session = connections[client_key]
+                        reduced, threshold = state.cc.on_loss(
+                            session.cwnd, seq_diff(target, (last_byte_acked + 1) & M32),
+                            time.monotonic())
+                        connections[client_key] = session._replace(
+                            cwnd=reduced + 3 * state.cc.mss,
+                            ssthresh=threshold, ca_state="FAST_RECOVERY")
+                        state.recover = state.recovery_guard = target
+                        state.partial_ack_seen = False
+                    print(f"[CUBIC] event=FAST_RETRANSMIT connection={client_key} "
+                          f"cwnd={session.cwnd:.3f}->{reduced + 3 * state.cc.mss:.3f} "
+                          f"ssthresh={threshold:.3f} recover={target}")
                     retransmit_oldest("3 duplicate ACKs (fast retransmit)")
-                    deadline = time.time() + rto
-            
+                    state.deadline = time.monotonic() + state.rto
+                    if return_on_update:
+                        return last_byte_acked, False
+
+
 def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> int:
+    """Serialize application writes on a connection; retain RTT/timers in it."""
+    key = (conn_info.client_ip, conn_info.client_port)
+    with connections_lock:
+        session = connections.get(key)
+        if session is None:
+            return -1
+        state = session.sender_state
+    with state.send_lock:
+        with connections_lock:
+            current = connections.get(key)
+            if (current is None or current.sender_state is not state
+                    or current.state in ("CLOSED", "RESET", "ERROR")):
+                return -1
+        return _run_conn_send(s, conn_info, payload)
+
+
+def _run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> int:
     """
     Send data on an established connection using raw sockets.
     
@@ -1415,7 +1402,8 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
     send_base = next_seq_num = start
     target = (start + len(payload)) & M32
     unacked = session.unacked
-    rtt = RttEstimator()
+    state = session.sender_state
+    rtt = state.rtt
     with connections_lock:
         connections[client_key] = connections[client_key]._replace(
             send_base=send_base, next_seq_num=next_seq_num
@@ -1428,11 +1416,17 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                 session = connections.get(client_key)
                 if session is None:
                     return -1
-                budget = max(0, session.peer_rwnd - seq_diff(next_seq_num, send_base))
+                budget = max(0, min(session.peer_rwnd, int(session.cwnd)) - seq_diff(next_seq_num, send_base))
+                # Count waiting for congestion-window ACKs, but exclude idle
+                # and receiver-limited periods (RFC 9438 4.2, 5.8).
+                state.cc.update_clock(time.monotonic(),
+                    session.peer_rwnd >= session.cwnd
+                    and seq_diff(target, send_base) >= int(session.cwnd)
+                    and state.recover is None)
             while next_seq_num != target:
                 with connections_lock:
                     session = connections[client_key]
-                    budget = max(0, session.peer_rwnd - seq_diff(next_seq_num, send_base))
+                    budget = max(0, min(session.peer_rwnd, int(session.cwnd)) - seq_diff(next_seq_num, send_base))
                 if budget == 0:
                     break
                 offset = seq_diff(next_seq_num, start)
@@ -1445,7 +1439,15 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                     seq=next_seq_num, ack_seq=session.client_seq,
                     payload=chunk, window=window
                 )
-                unacked[next_seq_num] = (chunk, time.time(), False)
+                # Resume on real non-probe transmission, including refill
+                # while older bytes remain outstanding. Preserve paused time.
+                state.cc.update_clock(time.monotonic(),
+                    session.peer_rwnd >= session.cwnd
+                    and seq_diff(target, send_base) >= int(session.cwnd)
+                    and state.recover is None, transmitting=True)
+                if not unacked:
+                    state.deadline = time.monotonic() + state.rto
+                unacked[next_seq_num] = (chunk, time.monotonic(), False)
                 next_seq_num = (next_seq_num + len(chunk)) & M32
                 budget -= len(chunk)
                 with connections_lock:
