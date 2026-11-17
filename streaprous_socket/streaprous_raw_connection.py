@@ -801,6 +801,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                             handshake_in_progress[client_key] = False
                         
                         print(f"[Streap_raw] Etablished handshak with connection: ({client_ip}:{client_port}) ESTABLISHED")
+                        session.worker_thread = "INIT"
+                        run_conn_recv(s, session)
                         return session
                     
                 print(f"[Streap_raw] Handshake timeout for {client_ip}:{client_port}")
@@ -839,6 +841,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                 with handshake_lock:
                     handshake_in_progress[client_key] = False
                 print(f"[Streap_raw] Etablished handshak with connection: ({client_ip}:{client_port}) ESTABLISHED")
+                session.worker_thread = "INIT"
+                run_conn_recv(s, session)
                 return session
                             
     except KeyboardInterrupt:
@@ -972,39 +976,42 @@ def run_conn_recv(s: socket.socket, session: conn_struct) -> bytes:
                     app_payload = tcp_packet[tcp_header_len:]
                     
                     if len(app_payload) > 0:
-                        print(f"[Streap_raw] Received {len(app_payload)} bytes of data from {client_ip}:{client_port}")
-                        print(f"[Streap_raw] Received payload: {app_payload[:100]}...")
+                        if session.peer_eof or session.state not in ("ESTABLISHED", "FIN_WAIT_1", "FIN_WAIT_2"):
+                            if not fin_flag:
+                                dup_ack = build_tcp_packet(session.server_ip, client_ip, listen_port, client_port, seq=session.server_seq, ack_seq=session.client_seq, ack=1)
+                                ip_header = build_ip_header(session.server_ip, client_ip, socket.IPPROTO_TCP, len(dup_ack))
+                                s.sendto(ip_header + dup_ack, (client_ip, 0))
+                        else:                            
+                            print(f"[Streap_raw] Received {len(app_payload)} bytes of data from {client_ip}:{client_port}")
+                            print(f"[Streap_raw] Received payload: {app_payload[:100]}...")
                         
                         # # Send ACK for received data IMMEDIATELY (fast path)
                         # next_ack = pkt_seq + len(app_payload)
                         
                         # Order check: accept only the segment that starts at the expected byte (client_seq)
-                        kind = classify_segment(session.client_seq, pkt_seq, len(app_payload))
-                        if kind == "partial_overlap":
-                            overlap_bytes = -seq_diff(pkt_seq, session.client_seq) # số byte đầu bị trùng
-                            app_payload = app_payload[overlap_bytes:]
-                            print(f"[Streap_raw] run_conn_recv: partial_overlap seq={pkt_seq}, trimmed {overlap_bytes}B, kept {len(app_payload)}B")
-                        elif kind != "in_order":
-                            print(f"[Streap_raw] run_conn_recv: {kind} seq={pkt_seq}, expected={session.client_seq} -> dup ACK")
-                            dup_ack = build_tcp_packet(session.server_ip, client_ip, listen_port, client_port, seq=session.server_seq, ack_seq=session.client_seq, ack=1)
-                            ip_header = build_ip_header(session.server_ip, client_ip, socket.IPPROTO_TCP, len(dup_ack))
-                            s.sendto(ip_header + dup_ack, (client_ip, 0))
-                            continue
-                        next_ack = (session.client_seq + len(app_payload)) & M32       
-
-                        ack_packet = build_tcp_packet(session.server_ip, client_ip, listen_port, client_port,
-                                                    seq=session.server_seq, ack_seq=next_ack, ack=1)
-                        ip_header = build_ip_header(session.server_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
-                        s.sendto(ip_header + ack_packet, (client_ip, 0))
-                        print(f"[Streap_raw] Sent ACK for data (Ack={next_ack})")
-                        
-                        # Update sequence numbers AFTER ACK sent
-                        with session.cv:
-                            session.client_seq = next_ack
-                            session.recv_buffer.extend(app_payload)
-                            session.last_activity = time.time()
-                            session.cv.notify_all()
-                
+                            kind = classify_segment(session.client_seq, pkt_seq, len(app_payload))
+                            if kind == "partial_overlap":
+                                overlap_bytes = -seq_diff(pkt_seq, session.client_seq) # số byte đầu bị trùng
+                                app_payload = app_payload[overlap_bytes:]
+                                print(f"[Streap_raw] run_conn_recv: partial_overlap seq={pkt_seq}, trimmed {overlap_bytes}B, kept {len(app_payload)}B")
+                            if kind in ("in_order", "partial_overlap"):
+                                next_ack = (session.client_seq + len(app_payload)) & M32
+                                ack_packet = build_tcp_packet(session.server_ip, client_ip, listen_port, client_port, seq=session.server_seq, ack_seq=next_ack, ack=1)
+                                ip_header = build_ip_header(session.server_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
+                                s.sendto(ip_header + ack_packet, (client_ip, 0))
+                                print(f"[Streap_raw] Sent ACK for data (Ack={next_ack})")
+                                                    
+                                # Update sequence numbers AFTER ACK sent
+                                with session.cv:
+                                    session.client_seq = next_ack
+                                    session.recv_buffer.extend(app_payload)
+                                    session.last_activity = time.time()
+                                    session.cv.notify_all()
+                            else:
+                                print(f"[Streap_raw] run_conn_recv: {kind} seq={pkt_seq}, expected={session.client_seq} -> dup ACK")
+                                dup_ack = build_tcp_packet(session.server_ip, client_ip, listen_port, client_port, seq=session.server_seq, ack_seq=session.client_seq, ack=1)
+                                ip_header = build_ip_header(session.server_ip, client_ip, socket.IPPROTO_TCP, len(dup_ack))
+                                s.sendto(ip_header + dup_ack, (client_ip, 0))
                 # Handle FIN (connection close)
                 if fin_flag:
                     fin_seq = (pkt_seq + len(tcp_packet[tcp_header_len:])) & M32
@@ -1040,9 +1047,12 @@ def run_conn_recv(s: socket.socket, session: conn_struct) -> bytes:
                     session.error = e
                 session.cv.notify_all()
     with session.cv:
-        if session.worker_thread is None or not session.worker_thread.is_alive():
+        start_only = (session.worker_thread == "INIT")
+        if start_only or session.worker_thread is None or not session.worker_thread.is_alive():
             session.worker_thread = threading.Thread(target=_recv_worker, daemon=True, name=f"recv-worker-{client_ip}:{client_port}")
             session.worker_thread.start()
+        if start_only:
+            return b""
     try:
         with session.cv:
             while len(session.recv_buffer) == 0 and not session.peer_eof and session.error is None and session.state != "CLOSED":
@@ -1345,9 +1355,16 @@ def close_connection(s: socket.socket, conn_info: conn_struct):
         remove_packet_queue(client_key)
         return
             
+    with session.cv:
+        need_init_worker = (session.worker_thread is None or not session.worker_thread.is_alive())
+        if need_init_worker:
+            session.worker_thread = "INIT"
+    if need_init_worker:
+        run_conn_recv(s, session)
+    
     rto = session.rtt.rto
     retries = 0
-    
+    tw_deadline = None
 
     def send_fin():
         with session.cv:
@@ -1357,60 +1374,71 @@ def close_connection(s: socket.socket, conn_info: conn_struct):
         s.sendto(ip_hdr + fin_pkt, (client_ip, 0))
         print(f"[Streap_raw] close_connection: Sent FIN (Seq={fin_seq}, Ack={cur_ack}, state={session.state})")
     
-    send_fin()
-    deadline = time.monotonic() + rto
+    try:
+        send_fin()
+        deadline = time.monotonic() + rto
 
-    with session.cv:
-        while True:
-            if session.error is not None or session.state == "CLOSED":
-                break
-            fin_acked = seq_diff(session.send_base, expected_fin_ack) >= 0
-            if fin_acked:
-                if session.state == "LAST_ACK":
-                    session.state = "CLOSED"
+        with session.cv:
+            while True:
+                if session.error is not None or session.state == "CLOSED":
                     break
-                elif session.state == "FIN_WAIT_1":
-                    session.state = "TIMED_WAIT" if session.peer_eof else "FIN_WAIT_2"
-                elif session.state == "CLOSING":
+                fin_acked = seq_diff(session.send_base, expected_fin_ack) >= 0
+                if fin_acked:
+                    if session.state == "LAST_ACK":
+                        session.state = "CLOSED"
+                        break
+                    elif session.state == "FIN_WAIT_1":
+                        session.state = "TIMED_WAIT" if session.peer_eof else "FIN_WAIT_2"
+                    elif session.state == "CLOSING":
+                        session.state = "TIMED_WAIT"
+                if session.state == "TIME_WAIT" or (fin_acked and session.peer_eof):
                     session.state = "TIMED_WAIT"
-            if session.state == "TIMED_WAIT" or (fin_acked and session.peer_eof):
-                session.state = "TIMED_WAIT"
-                session.cv.wait(timeout=session.rtt.rto)
-                session.state = "CLOSED"
-                break
-            
-            left = deadline - time.monotonic()
-            if left <= 0:
-                if not fin_acked:
-                    if retries >= MAX_RETRIES:
-                        session.error = TimeoutError("Handshake đóng kết nối (FIN) vượt quá số lần thử lại")
+                    if tw_deadline is None:
+                        tw_deadline = time.monotonic() + session.rtt.rto
+                    tw_left = tw_deadline - time.monotonic()
+                    if tw_left <= 0:
+                        session.state = "CLOSED"
                         break
-                    retries += 1
-                    rto = min(rto * 2, MAX_RTO)
-                    session.rtt.rto = rto
-                    deadline = time.monotonic() + rto
-                    session.cv.release()
-                    try:
-                        send_fin()
-                    finally:
-                        session.cv.acquire()
+                    session.cv.wait(timeout=min(tw_left, 0.5))
                     continue
-                else:
-                    if retries >= MAX_RETRIES:
-                        break
-                    retries += 1
-                    deadline = time.monotonic() + rto
-                    continue
-            
-            session.cv.wait(timeout=min(left, 0.5))
-        
-        session.state = "CLOSED"
-        session.cv.notify_all()
-    
-    with connections_lock:
-        connections.pop(client_key, None)
-    remove_packet_queue(client_key)
-
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    if not fin_acked:
+                        if retries >= MAX_RETRIES:
+                            session.error = TimeoutError("Handshake đóng kết nối (FIN) vượt quá số lần thử lại")
+                            break
+                        retries += 1
+                        rto = min(rto * 2, MAX_RTO)
+                        session.rtt.rto = rto
+                        deadline = time.monotonic() + rto
+                        session.cv.release()
+                        try:
+                            send_fin()
+                        finally:
+                            session.cv.acquire()
+                        continue
+                    else:
+                        if retries >= MAX_RETRIES:
+                            break
+                        retries += 1
+                        deadline = time.monotonic() + rto
+                        continue
+                    
+                session.cv.wait(timeout=min(left, 0.5))
+    except Exception as e:
+        print(f"[Streap_raw] Error in close_connection: {e}")
+        with session.cv:
+            if session.error is None:
+                session.error = e
+    finally:
+        with session.cv:
+            session.state = "CLOSED"
+            session.timer_deadline = None
+            session.fast_retransmit_pending = False
+            session.cv.notify_all()
+        with connections_lock:
+            connections.pop(client_key, None)
+        remove_packet_queue(client_key)
 
 def close_all_connections():
     """Close all connections and clean up."""
