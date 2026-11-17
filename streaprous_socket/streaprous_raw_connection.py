@@ -394,6 +394,7 @@ def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, a
     return tcp_header
 
 
+
 def build_ip_header(src_ip, dest_ip, protocol, payload_len):
     """Builds a structurally flawless 20-byte IP header.
 
