@@ -29,6 +29,7 @@ import time
 # Global structure for packet dispatcher
 # The multi connections are managed by client_key map to queue.Queue
 _packet_queues = {}
+_ack_queues = {}
 _packet_dispatcher_thread = None
 _packet_dispatcher_running = False
 _packet_dispatcher_lock = threading.Lock()
@@ -68,10 +69,13 @@ def _packet_dispatcher(s, listen_port):
             with _packet_dispatcher_lock:
                 # queue of client
                 client_key = _packet_queues.get(key)
+                ack_target = None
 
                 if client_key is not None:
                     # known client_key connection exist in queues
                     target = client_key # target is the queue of that specific client                             
+                    if is_ack:
+                        ack_target = _ack_queues.setdefault(key, queue.Queue(maxsize=100))
                     print(f"[Sock_dispatcher] Route packet to existing queue for {key} (flags=0x{flags:02x}, SYN={is_syn}, ACK={is_ack})")
                 elif is_syn:
                     # Non-established connection with syn handshaking
@@ -87,6 +91,20 @@ def _packet_dispatcher(s, listen_port):
                 target.put_nowait((packet, addr)) 
             except queue.Full:
                 pass
+            # The receive worker and sender have independent consumers. Copy
+            # ACK-bearing packets so background receive processing cannot steal
+            # ACKs awaited by wait_for_ack().
+            if ack_target is not None:
+                try:
+                    ack_target.put_nowait((packet, addr))
+                except queue.Full:
+                    # ACK numbers are cumulative; keeping the newest packet is
+                    # more useful than retaining stale window/ACK information.
+                    try:
+                        ack_target.get_nowait()
+                        ack_target.put_nowait((packet, addr))
+                    except queue.Empty:
+                        pass
         except Exception as e:
             print(f"[Sock_dispatcher] Dispatcher error: {e}")
 
@@ -141,6 +159,14 @@ def get_packet_queue(client_key):
         return _packet_queues[client_key]
 
 
+def get_ack_queue(client_key):
+    """Get the sender-side queue for ACK-bearing packets of a connection."""
+    with _packet_dispatcher_lock:
+        if client_key not in _ack_queues:
+            _ack_queues[client_key] = queue.Queue(maxsize=100)
+        return _ack_queues[client_key]
+
+
 def remove_packet_queue(client_key):
     """Remove packet queue.
 
@@ -151,3 +177,4 @@ def remove_packet_queue(client_key):
     with _packet_dispatcher_lock:
         if client_key in _packet_queues:
             del _packet_queues[client_key]
+        _ack_queues.pop(client_key, None)

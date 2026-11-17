@@ -33,6 +33,7 @@ from .streaprous_packet_dispatcher import (
     start_packet_dispatcher,
     stop_packet_dispatcher,
     get_packet_queue,
+    get_ack_queue,
     remove_packet_queue,
     _packet_dispatcher_lock,
     _SYN_KEY,
@@ -55,7 +56,8 @@ conn_struct = namedtuple('conn_struct', [
     # connection by the factory below, never shared as namedtuple defaults.
     'send_base', 'next_seq_num', 'rcv_buffer',
     'rcv_buffer_size', 'last_byte_read', 'peer_rwnd',
-    'cwnd', 'ssthresh', 'ca_state', 'dup_ack_count', 'unacked'
+    'cwnd', 'ssthresh', 'ca_state', 'dup_ack_count', 'unacked',
+    'peer_window_seq', 'peer_window_ack'
 ], defaults=(None,) * 11)
 
 
@@ -74,6 +76,8 @@ def new_connection(**fields):
     fields.setdefault('ca_state', 'SLOW_START')
     fields.setdefault('dup_ack_count', 0)
     fields.setdefault('unacked', {})
+    fields.setdefault('peer_window_seq', None)
+    fields.setdefault('peer_window_ack', None)
     return conn_struct(**fields)
 
 
@@ -81,6 +85,12 @@ def new_connection(**fields):
 # The mapping include {key: value} as { (client_ip, client_port): conn_struct }
 connections = {}
 connections_lock = threading.Lock()
+
+# The transport receiver runs independently of application reads (Slides 90-93).
+# An Event wakes run_conn_recv() when the receiver buffers data or closes.
+_receive_workers = {}
+_receive_events = {}
+_receive_workers_lock = threading.Lock()
 
 # Management structure to serialize the 3-way handshake
 # Each hand shake is manage by a unique ID client_key
@@ -365,7 +375,9 @@ def read_contiguous_buffer(session, max_bytes=None):
     if max_bytes is not None and max_bytes < 0:
         raise ValueError("max_bytes must be nonnegative")
     next_read = (session.last_byte_read + 1) & M32
-    available = seq_diff(session.client_seq, next_read)
+    # FIN consumes a sequence number, but is never application payload.
+    data_end = (session.client_seq - (session.state == "CLOSE_WAIT")) & M32
+    available = seq_diff(data_end, next_read)
     count = available if max_bytes is None else min(available, max_bytes)
     if count <= 0:
         return b"", session
@@ -649,7 +661,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                         server_seq=server_seq,
                         client_seq=pkt_seq,
                         expected_final_ack=server_seq + 1,
-                        last_activity=time.time()
+                        last_activity=time.time(),
+                        peer_rwnd=tcph[6],
                     )
                     session = connections[client_key]
 
@@ -711,7 +724,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                                 server_seq=pkt_ack,
                                 client_seq=pkt_seq,
                                 expected_final_ack=session.expected_final_ack,
-                                last_activity=time.time()
+                                last_activity=time.time(),
+                                peer_rwnd=tcph[6],
                             )
                             session = connections[client_key]
 
@@ -721,6 +735,7 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
 
                         print(f"[Streap_raw] Etablished handshak with connection: ({client_ip}:{client_port}) ESTABLISHED")
                         
+                        start_connection_receiver(s, session)
                         # Return the established connection info
                         return session
                 
@@ -756,7 +771,8 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                         server_seq=pkt_ack,
                         client_seq=pkt_seq,
                         expected_final_ack=session.expected_final_ack,
-                        last_activity=time.time()
+                        last_activity=time.time(),
+                        peer_rwnd=tcph[6],
                     )
                     session = connections[client_key]
 
@@ -766,6 +782,7 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
 
                 print(f"[Streap_raw] Etablished handshak with connection: ({client_ip}:{client_port}) ESTABLISHED")
                 
+                start_connection_receiver(s, session)
                 # Return the established connection info
                 return session
 
@@ -893,10 +910,12 @@ def raw_connect(dest_ip: str, dest_port: int, client_port: int = None, interface
                     server_seq=next_client_seq, # local sending seq
                     client_seq=next_server_ack, # remote next expected seq
                     expected_final_ack=0,
-                    last_activity=time.time()
+                    last_activity=time.time(),
+                    peer_rwnd=tcph[6],
                 )
                 connections[remote_key] = session
                 
+            start_connection_receiver(s, session)
             print(f"[Streap_raw] raw_connect: Connection ESTABLISHED with {dest_ip}:{dest_port}")
             return session, s
             
@@ -909,57 +928,113 @@ def raw_connect(dest_ip: str, dest_port: int, client_port: int = None, interface
     return None, None
 
 
-def run_conn_recv(s: socket.socket, conn_info: conn_struct, max_bytes: int = None) -> bytes:
+def start_connection_receiver(s: socket.socket, conn_info: conn_struct):
+    """Start transport-side packet processing independently of application reads.
+
+    Buffering and ACK/window advertisement continue while the application is
+    busy (Slides 90-95).
     """
-    Receive data on an established connection using raw sockets.
-    This function handles incoming packets for a specific connection by reading
-    from the packet dispatcher's per-connection queue.
+    key = (conn_info.client_ip, conn_info.client_port)
+    with _receive_workers_lock:
+        worker = _receive_workers.get(key)
+        if worker is not None and worker.is_alive() and key in _receive_events:
+            return
+        _receive_events[key] = threading.Event()
+        worker = threading.Thread(
+            target=_run_conn_receive_loop,
+            args=(s, conn_info),
+            daemon=True,
+            name=f"tcp-recv-{conn_info.client_ip}-{conn_info.client_port}",
+        )
+        _receive_workers[key] = worker
+        worker.start()
+
+
+def run_conn_recv(s: socket.socket, conn_info: conn_struct, max_bytes: int = None) -> bytes:
+    """Read contiguous buffered bytes for the application.
+
+    Removing bytes advances LastByteRead and reopens receive-window capacity
+    (Slides 90-95); packet processing is done by the independent receiver.
+    """
+    if max_bytes is not None and max_bytes < 0:
+        raise ValueError("max_bytes must be nonnegative")
+    if max_bytes == 0:
+        return b""
+    key = (conn_info.client_ip, conn_info.client_port)
+    with _receive_workers_lock:
+        event = _receive_events.get(key)
+    if event is None:
+        start_connection_receiver(s, conn_info)
+        with _receive_workers_lock:
+            event = _receive_events[key]
+
+    while True:
+        with connections_lock:
+            session = connections.get(key)
+            if session is None:
+                return b""
+            if session.state == "ERROR":
+                raise ConnectionError("transport receiver failed; see receiver error log")
+            delivered, session = read_contiguous_buffer(session, max_bytes)
+            if delivered:
+                connections[key] = session
+                # The ACK number is still the next contiguous byte expected;
+                # the larger window advertises the space freed by the app read.
+                window = get_current_rwnd(session)
+                ack_packet = build_tcp_packet(
+                    session.server_ip, session.client_ip,
+                    session.server_port, session.client_port,
+                    seq=session.server_seq, ack_seq=session.client_seq,
+                    ack=1, window=window,
+                )
+                ip_header = build_ip_header(
+                    session.server_ip, session.client_ip,
+                    socket.IPPROTO_TCP, len(ack_packet),
+                )
+                closed = False
+            else:
+                ack_packet = None
+                closed = session.state in ("CLOSED", "RESET", "CLOSE_WAIT")
+        if ack_packet is not None:
+            s.sendto(ip_header + ack_packet, (session.client_ip, 0))
+            return delivered
+        if closed:
+            return b""
+        # Recheck periodically so an event arriving between the buffer check
+        # and wait cannot leave the application asleep indefinitely.
+        event.wait(0.1)
+        event.clear()
+
+
+def _run_conn_receive_loop(s: socket.socket, conn_info: conn_struct) -> None:
+    """
+    Transport-side receive loop: validate, buffer, and ACK packets continuously.
+    It deliberately does not remove payload bytes; only the application read
+    path advances LastByteRead and frees receive-buffer space (Slides 90-95).
     
     Args:
         s: raw socket
         conn_info: conn_struct tuple for the connection
-        max_bytes: optional maximum number of contiguous bytes to read
-    
-    Returns:
-        bytes: The received data payload, or empty bytes if connection closed
     """
     client_ip = conn_info.client_ip
     client_port = conn_info.client_port
     client_key = (client_ip, client_port)
     listen_ip = conn_info.server_ip
     listen_port = conn_info.server_port
-    if max_bytes is not None and max_bytes < 0:
-        raise ValueError("max_bytes must be nonnegative")
-    if max_bytes == 0:
-        return b""
-
-    with connections_lock:
-        session = connections.get(client_key)
-        if session is not None:
-            delivered, session = read_contiguous_buffer(session, max_bytes)
-            if delivered:
-                connections[client_key] = session
-                window = get_current_rwnd(session)
-                ack_packet = build_tcp_packet(
-                    listen_ip, client_ip, listen_port, client_port,
-                    seq=session.server_seq, ack_seq=session.client_seq, ack=1, window=window
-                )
-                ip_header = build_ip_header(listen_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
-            else:
-                ack_packet = None
-        else:
-            ack_packet = None
-    if ack_packet is not None:
-        s.sendto(ip_header + ack_packet, (client_ip, 0))
-        return delivered
-    
+    receive_event = _receive_events[client_key]
     # Get the packet queue for this connection from the dispatcher
     packet_queue = get_packet_queue(client_key)
     
     print(f"[Streap_raw] run_conn_recv: Starting receive loop for {client_ip}:{client_port} (waiting for data...)")
     
+    # Remember an out-of-order FIN until all preceding bytes arrive. This is
+    # transport bookkeeping, not an additional payload receive buffer.
+    pending_fin = None
     try:
         while True:
+            with connections_lock:
+                if client_key not in connections or _receive_events.get(client_key) is not receive_event:
+                    return
             # Get packet from the dispatcher queue instead of reading directly from socket
             try:
                 packet, addr = packet_queue.get(timeout=1.0)
@@ -1004,52 +1079,55 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct, max_bytes: int = Non
 
             print(f"[Streap_raw] run_conn_recv: Received packet from {client_ip}:{client_port} (SYN={syn_flag}, ACK={ack_flag}, PSH={psh_flag}, FIN={fin_flag}, RST={rst_flag}, Seq={pkt_seq}, Ack={pkt_ack}, Win={window_size})")
 
-            with connections_lock:
-                if client_key not in connections:
-                    continue
-                session = connections[client_key]._replace(peer_rwnd=window_size)
-                connections[client_key] = session
-
-            # Handle FIN (connection close)
-            if fin_flag:
-                print(f"[Streap_raw] Received FIN from {client_ip}:{client_port}")
-                # Send ACK for FIN
-                ack_packet = build_tcp_packet(listen_ip, client_ip, listen_port, client_port,
-                                              seq=session.server_seq, ack_seq=pkt_seq + 1, ack=1)
-                ip_header = build_ip_header(listen_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
-                s.sendto(ip_header + ack_packet, (client_ip, 0))
-                
-                with connections_lock:
-                    if client_key in connections:
-                        del connections[client_key]
-                # Clean up packet queue
-                remove_packet_queue(client_key)
-                return b""
-
-            # Handle RST (connection reset)
+            tcp_header_len = ((tcp_packet[12] >> 4) & 0x0F) * 4
+            if tcp_header_len < 20 or tcp_header_len > len(tcp_packet):
+                continue
             if rst_flag:
-                print(f"[Streap_raw] Received RST from {client_ip}:{client_port}")
                 with connections_lock:
-                    if client_key in connections:
-                        del connections[client_key]
-                # Clean up packet queue
-                remove_packet_queue(client_key)
-                return b""
-
-            # Update last activity
+                    session = connections.get(client_key)
+                    if session is not None:
+                        connections[client_key] = session._replace(state="RESET")
+                return
+            if syn_flag or not ack_flag:
+                continue
             with connections_lock:
-                if client_key in connections:
-                    connections[client_key] = session._replace(last_activity=time.time())
+                session = connections.get(client_key)
+                if session is None:
+                    return
+                # Always replace the latest record under the same lock. App
+                # reads and sender updates must never be overwritten by a copy.
+                session = session._replace(last_activity=time.time())
+                connections[client_key] = session
 
             # Store both contiguous and out-of-order unread bytes in one buffer.
             tcp_header_len = ((tcp_packet[12] >> 4) & 0x0F) * 4
-            if ack_flag and not syn_flag and not fin_flag and not rst_flag and len(tcp_packet) > tcp_header_len:
+            has_data = len(tcp_packet) > tcp_header_len
+            if has_data or fin_flag:
                 app_payload = tcp_packet[tcp_header_len:]
                 with connections_lock:
                     session = connections.get(client_key)
                     if session is None:
                         continue
                     window_start = (session.last_byte_read + 1) & M32
+                    if session.state == "CLOSE_WAIT":
+                        app_payload = b""
+                    elif fin_flag and pending_fin is None:
+                        fin_seq = (pkt_seq + len(app_payload)) & M32
+                        # FIN must lie in the receive window and cannot precede
+                        # data already acknowledged (TCP ordered byte stream).
+                        if (seq_diff(fin_seq, session.client_seq) >= 0
+                                and 0 <= seq_diff(fin_seq, window_start) < session.rcv_buffer_size):
+                            pending_fin = fin_seq
+                            # Previously buffered out-of-order bytes beyond FIN
+                            # are outside the completed stream; never deliver them.
+                            for start, data in list(session.rcv_buffer.items()):
+                                count = max(0, seq_diff(fin_seq, start))
+                                if count == 0:
+                                    del session.rcv_buffer[start]
+                                elif count < len(data):
+                                    session.rcv_buffer[start] = data[:count]
+                    if pending_fin is not None:
+                        app_payload = app_payload[:max(0, seq_diff(pending_fin, pkt_seq))]
                     merge_interval_into_rcv_buffer(
                         session.rcv_buffer, pkt_seq, app_payload,
                         session.rcv_buffer_size, window_start
@@ -1066,10 +1144,17 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct, max_bytes: int = Non
                             break
                         start, data = covering
                         next_expected = (start + len(data)) & M32
+                    if pending_fin is not None and seq_diff(next_expected, pending_fin) >= 0:
+                        # FIN is acknowledged only after the missing prefix is
+                        # present. Preserve unread data until the app drains it.
+                        next_expected = (pending_fin + 1) & M32
+                        session = session._replace(state="CLOSE_WAIT")
+                        pending_fin = None
                     session = session._replace(client_seq=next_expected, last_activity=time.time())
                     connections[client_key] = session
-                    delivered, session = read_contiguous_buffer(session, max_bytes)
-                    connections[client_key] = session
+                    # Buffer occupancy includes unread in-order and out-of-order
+                    # bytes. ACK remains cumulative (next_expected); rwnd reports
+                    # free space in this receive buffer (Slides 78-80, 94-95).
                     window = get_current_rwnd(session)
                     ack_packet = build_tcp_packet(
                         listen_ip, client_ip, listen_port, client_port,
@@ -1077,28 +1162,27 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct, max_bytes: int = Non
                     )
                     ip_header = build_ip_header(listen_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
                 s.sendto(ip_header + ack_packet, (client_ip, 0))
-                if delivered:
-                    return delivered
+                receive_event.set()
                 continue
 
-            # Handle pure ACK (no data)
-            elif ack_flag and not syn_flag and not psh_flag and not has_data:
-                print(f"[Streap_raw] Received ACK from {client_ip}:{client_port} (Ack={pkt_ack})")
-                with connections_lock:
-                    if client_key in connections:
-                        connections[client_key] = session._replace(
-                            server_seq=pkt_ack,
-                            last_activity=time.time()
-                        )
+            # ACK processing for sent data belongs to wait_for_ack(), which
+            # validates ACK numbers before advancing send_base. A peer ACK must
+            # never overwrite server_seq (the next sequence to send).
 
-    except KeyboardInterrupt:
-        print("\n[Streap_raw] Receive loop interrupted.")
-        return b""
     except Exception as e:
-        print(f"[Streap_raw] Error in run_conn_recv: {e}")
-        return b""
+        print(f"[Streap_raw] Transport receiver failed for {client_key}: {e}")
+        with connections_lock:
+            session = connections.get(client_key)
+            if session is not None and _receive_events.get(client_key) is receive_event:
+                connections[client_key] = session._replace(state="ERROR")
+    finally:
+        receive_event.set()
+        with _receive_workers_lock:
+            if _receive_workers.get(client_key) is threading.current_thread():
+                _receive_workers.pop(client_key, None)
 
-def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq):
+
+def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq, return_on_update=False, probe_data=b""):
     """Wait for the client to ACK up to the last byte of the response, and retransmit lost segments.
 
     Returns (last_byte_acked, all_acked).
@@ -1108,27 +1192,34 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq):
       - the RTO timer expires (RTO doubles after each expiry), or
       - exactly 3 consecutive duplicate ACKs arrive (fast retransmit).
     Gives up after MAX_RETRIES consecutive retransmissions without progress.
+    return_on_update lets the existing sender refill its sliding window after
+    a new ACK or window update, without waiting for all outstanding data.
     """
     last_byte_acked = (start - 1) & M32          # no byte acknowledged yet
     last_byte_sent = (target - 1) & M32          # last byte of the response
-    if seq_diff(start, target) >= 0:             # nothing to wait for
+    if seq_diff(start, target) >= 0 and not return_on_update:
         return last_byte_acked, True
 
     client_key = (conn_info.client_ip, conn_info.client_port)
-    packet_queue = get_packet_queue(client_key)
+    packet_queue = get_ack_queue(client_key)
     rto = rtt.rto
     retries = 0
     dup_count = 0
     deadline = time.time() + rto
+    # Textbook 3.5.5 (p.248): probe zero windows with one data byte.
+    # Fixed 1 second is the group's simulation policy, not a textbook/RFC timer.
+    probe_deadline = time.monotonic() + 1.0
 
     def retransmit_oldest(reason):
-        seg_seq = next(iter(unacked))            # first key = oldest segment
+        seg_seq = min(unacked, key=lambda seq: seq_diff(seq, start))
         seg_chunk = unacked[seg_seq][0]
-        cur_rwnd = get_current_rwnd(conn_info)
+        with connections_lock:
+            session = connections[client_key]
+            cur_rwnd = get_current_rwnd(session)
         send_tcp_data_segment(
             s, conn_info.server_ip, conn_info.client_ip,
             conn_info.server_port, conn_info.client_port,
-            seq=seg_seq, ack_seq=ack_seq, payload=seg_chunk,
+            seq=seg_seq, ack_seq=session.client_seq, payload=seg_chunk,
             window=cur_rwnd
         )
         unacked[seg_seq] = (seg_chunk, time.time(), True)   # True = already retransmitted
@@ -1136,10 +1227,51 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq):
               f"reason: {reason}, RTO={rto*1000:.0f} ms, attempt {retries}")
 
     while True:
-        left = deadline - time.time()
+        with connections_lock:
+            session = connections.get(client_key)
+            if session is None or session.state in ("CLOSED", "RESET", "ERROR"):
+                raise ConnectionError("connection closed while waiting for ACK/window")
+            zero_window = session.peer_rwnd == 0
+        if zero_window:
+            if time.monotonic() >= probe_deadline:
+                if unacked:
+                    probe_seq = min(unacked, key=lambda seq: seq_diff(seq, start))
+                    chunk, sent_at, _ = unacked[probe_seq]
+                    probe_byte = chunk[:1]
+                    unacked[probe_seq] = (chunk, sent_at, True)
+                elif probe_data:
+                    probe_seq, probe_byte = target, probe_data[:1]
+                    unacked[probe_seq] = (probe_byte, time.time(), True)
+                    target = (target + 1) & M32
+                    last_byte_sent = (target - 1) & M32
+                    with connections_lock:
+                        connections[client_key] = connections[client_key]._replace(
+                            next_seq_num=target, server_seq=target)
+                else:
+                    probe_byte = b""
+                if probe_byte:
+                    with connections_lock:
+                        session = connections[client_key]
+                        probe_window = get_current_rwnd(session)
+                    send_tcp_data_segment(
+                        s, conn_info.server_ip, conn_info.client_ip,
+                        conn_info.server_port, conn_info.client_port,
+                        seq=probe_seq, ack_seq=session.client_seq,
+                        payload=probe_byte, window=probe_window)
+                probe_deadline = time.monotonic() + 1.0
+            # Persist waits do not exhaust data-loss retries or trigger fast
+            # retransmit. Poll close/error state even when the peer is silent.
+            left = min(0.2, max(0.001, probe_deadline - time.monotonic()))
+            deadline = time.time() + rto
+        else:
+            left = min(0.2, deadline - time.time())
+        if not unacked and not zero_window:
+            left = 0.2
         if left <= 0:                            # RTO expired
             if retries >= MAX_RETRIES:
                 print(f"[Streap_raw] wait_for_ack: GIVE UP after {retries} retransmissions, last_byte_acked={last_byte_acked}")
+                if return_on_update:
+                    raise TimeoutError("peer did not acknowledge outstanding data")
                 return last_byte_acked, False
             retries += 1
             retransmit_oldest("RTO expired")     # the log shows the RTO that just expired
@@ -1173,12 +1305,34 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq):
             continue
         if not (flags & 0x10):                   # no ACK flag
             continue
+        if flags & 0x07:                        # no SYN, RST or FIN as data ACK
+            continue
+        if packet[12:16] != socket.inet_aton(conn_info.client_ip) or packet[16:20] != socket.inet_aton(conn_info.server_ip):
+            continue
+        if seq_diff(pkt_ack, start) < 0 or seq_diff(pkt_ack, target) > 0:
+            continue                            # ACK cannot acknowledge unsent bytes
 
         # Flow Control: Update peer_rwnd from advertised window in TCP header (Slide 94-95)
         with connections_lock:
             client_key = (conn_info.client_ip, conn_info.client_port)
-            if client_key in connections:
-                connections[client_key] = connections[client_key]._replace(peer_rwnd=window_size)
+            if client_key not in connections:
+                return last_byte_acked, False
+            session = connections[client_key]
+            old_window = session.peer_rwnd
+            # Window freshness bookkeeping follows TCP's ordered SEQ/ACK
+            # update rule; these fields are sender metadata, not payload buffers.
+            fresh_window = (session.peer_window_seq is None
+                or seq_diff(pkt_seq, session.peer_window_seq) > 0
+                or (pkt_seq == session.peer_window_seq
+                    and seq_diff(pkt_ack, session.peer_window_ack) >= 0))
+            if fresh_window:
+                connections[client_key] = session._replace(
+                    peer_rwnd=window_size, peer_window_seq=pkt_seq,
+                    peer_window_ack=pkt_ack)
+            else:
+                window_size = old_window
+            if old_window != 0 and window_size == 0:
+                probe_deadline = time.monotonic() + 1.0
 
         new_last = (pkt_ack - 1) & M32           # ACK number = next byte expected, so last byte received = ACK - 1
         if seq_diff(new_last, last_byte_acked) > 0:          # NEW ACK: advance
@@ -1191,6 +1345,10 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq):
                     del unacked[seg_seq]
                     if not was_retx:             # Karn: do not sample RTT from retransmitted segments
                         newest_sent_at = seg_sent_at
+                elif seq_diff(pkt_ack, seg_seq) > 0:
+                    # A cumulative ACK may cover only a prefix of a segment.
+                    del unacked[seg_seq]
+                    unacked[pkt_ack] = (seg_chunk[seq_diff(pkt_ack, seg_seq):], seg_sent_at, was_retx)
             if newest_sent_at is not None:
                 sample = time.time() - newest_sent_at
                 rtt.update(sample)
@@ -1200,12 +1358,20 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq):
                   f"{seq_diff(last_byte_sent, last_byte_acked)} bytes remaining, {len(unacked)} unacked segments)")
             if seq_diff(last_byte_acked, last_byte_sent) >= 0:
                 return last_byte_acked, True
+            if return_on_update:
+                return last_byte_acked, False
             retries = 0
             dup_count = 0
             rto = rtt.rto
             deadline = time.time() + rto         # progress made: restart the timer
 
-        elif new_last == last_byte_acked and unacked:        # DUPLICATE ACK
+        elif new_last == last_byte_acked and window_size != old_window:
+            # An unchanged ACK number can advertise newly available space.
+            # A window update is not counted as a duplicate loss indication.
+            if return_on_update:
+                return last_byte_acked, not unacked
+            dup_count = 0
+        elif new_last == last_byte_acked and unacked and not zero_window:        # DUPLICATE ACK
             tcp_hdr_len = ((tcp_packet[12] >> 4) & 0x0F) * 4
             pure_ack = len(tcp_packet) == tcp_hdr_len and not (flags & 0x07)   # no SYN/RST/FIN, no data
             if pure_ack:
@@ -1239,36 +1405,70 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
             return -1
         session = connections[client_key]
     
-    seq = session.server_seq
-    total = 0
-    unacked = {}
+    if not payload:
+        return 0
+    if len(payload) >= 0x80000000:
+        raise ValueError("payload exceeds the supported sequence comparison range")
+    if session.unacked:
+        raise ValueError("connection already has unacknowledged data")
+    start = session.server_seq
+    send_base = next_seq_num = start
+    target = (start + len(payload)) & M32
+    unacked = session.unacked
     rtt = RttEstimator()
-    cur_rwnd = get_current_rwnd(session)
+    with connections_lock:
+        connections[client_key] = connections[client_key]._replace(
+            send_base=send_base, next_seq_num=next_seq_num
+        )
     try:
-        for chunk in split_into_segments(payload):
-            send_tcp_data_segment(
-                s, listen_ip, client_ip, listen_port, client_port,
-                seq=seq, ack_seq=session.client_seq, payload=chunk,
-                window=cur_rwnd
-            )
-            unacked[seq] = (chunk, time.time(), False)
-            seq = (seq + len(chunk)) & M32
-            total += len(chunk)
-
-        print(f"[Streap_raw] run_conn_send Sent {total} bytes in segments to {client_ip}:{client_port}")
-        last_byte_acked, all_acked = wait_for_ack(s, conn_info, session.server_seq, seq, unacked, rtt, session.client_seq)
-        print(f"[Streap_raw] run_conn_send ACK {'COMPLETE' if all_acked else 'INCOMPLETE'}: LastByteAcked={last_byte_acked}, LastByteSent={(seq - 1) & M32}, {len(unacked)} unacked segments")
-        if not all_acked:
-            print(f"[Streap_raw] run_conn_send FAILED: client did not ACK all data")
-            return -1            # does not update server_seq
-
-        with connections_lock:
-            if client_key in connections:
-                # use the latest entry in the table, not the stale `session` copy
-                connections[client_key] = connections[client_key]._replace(
-                    server_seq=seq, last_activity=time.time()
+        while send_base != target:
+            # Textbook 3.5.5 / slides 94-95: outstanding bytes are limited
+            # by the peer's advertised receive window, in byte units.
+            with connections_lock:
+                session = connections.get(client_key)
+                if session is None:
+                    return -1
+                budget = max(0, session.peer_rwnd - seq_diff(next_seq_num, send_base))
+            while next_seq_num != target:
+                with connections_lock:
+                    session = connections[client_key]
+                    budget = max(0, session.peer_rwnd - seq_diff(next_seq_num, send_base))
+                if budget == 0:
+                    break
+                offset = seq_diff(next_seq_num, start)
+                chunk = payload[offset:offset + min(MSS, budget)]
+                with connections_lock:
+                    session = connections[client_key]
+                    window = get_current_rwnd(session)
+                send_tcp_data_segment(
+                    s, listen_ip, client_ip, listen_port, client_port,
+                    seq=next_seq_num, ack_seq=session.client_seq,
+                    payload=chunk, window=window
                 )
-        return total
+                unacked[next_seq_num] = (chunk, time.time(), False)
+                next_seq_num = (next_seq_num + len(chunk)) & M32
+                budget -= len(chunk)
+                with connections_lock:
+                    connections[client_key] = connections[client_key]._replace(
+                        next_seq_num=next_seq_num, server_seq=next_seq_num,
+                        last_activity=time.time()
+                    )
+
+            last_byte_acked, _ = wait_for_ack(
+                s, conn_info, send_base, next_seq_num, unacked, rtt,
+                session.client_seq, return_on_update=True,
+                probe_data=payload[seq_diff(next_seq_num, start):seq_diff(next_seq_num, start)+1]
+            )
+            with connections_lock:
+                next_seq_num = connections[client_key].next_seq_num
+            send_base = (last_byte_acked + 1) & M32
+            with connections_lock:
+                if client_key not in connections:
+                    return -1
+                connections[client_key] = connections[client_key]._replace(
+                    send_base=send_base, last_activity=time.time()
+                )
+        return len(payload)
 
     except Exception as e:
         print(f"[Streap_raw] run_conn_send Error in run_conn_send: {e}")
@@ -1294,11 +1494,23 @@ def close_connection(s: socket.socket, conn_info: conn_struct):
             print(f"[Streap_raw] run_conn_send: Send FIN to {client_ip}:{client_port}")
             del connections[client_key]
     
-    # Clean up packet queue
+    # Wake application reads; the worker notices removal on its queue timeout.
+    with _receive_workers_lock:
+        event = _receive_events.pop(client_key, None)
+    if event is not None:
+        event.set()
     remove_packet_queue(client_key)
 
 
 def close_all_connections():
     """Close all connections and clean up."""
     with connections_lock:
+        keys = list(connections)
         connections.clear()
+    for key in keys:
+        remove_packet_queue(key)
+    with _receive_workers_lock:
+        events = list(_receive_events.values())
+        _receive_events.clear()
+    for event in events:
+        event.set()
