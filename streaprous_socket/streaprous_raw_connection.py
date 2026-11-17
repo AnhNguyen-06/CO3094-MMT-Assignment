@@ -117,12 +117,15 @@ def on_ack(conn, segment, received_at):
 
     ack = segment.ack
     with conn.cv:
+        if conn.state not in ("ESTABLISHED", "CLOSE_WAIT", "FIN_WAIT_1", "FIN_WAIT_2", "CLOSING", "LAST_ACK", "TIMED_WAIT"): # slide 96, 103, 104 chapter 3: ACK được xử lý theo vòng đời connection
+            return "invalid"
         if conn.error is not None or seq_diff(ack, conn.server_seq) > 0: # ACK phải nằm trong giới hạn dữ liệu đã gửi
             return "invalid"
         progress = seq_diff(ack, conn.send_base)
         if progress < 0:
             return "old"
         elif progress == 0:
+            conn.last_activity = time.time()
             pure_ack = (not segment.payload and not (segment.flags & 0x07)) # ko có SYN/RST/FIN
             same_window = segment.window == conn.last_ack_window
             if conn.unacked and pure_ack and same_window:
@@ -155,6 +158,7 @@ def on_ack(conn, segment, received_at):
                 break
 
         conn.send_base = ack # slide 146 chapter 3: send_base = y
+        conn.last_activity = time.time()
         # slide 81 chapter 3: bỏ qua mẫu từ retransmission, chọn cách thận trọng: bỏ mẫu nếu ACK này cũng xác nhận dữ liệu đã từng được gửi lại
         if rtt_sample is not None and not ack_retransmission:
             conn.rtt.update(rtt_sample)
@@ -751,6 +755,7 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                                 session.state = "ESTABLISHED"
                                 session.server_seq = pkt_ack
                                 session.send_base = pkt_ack
+                                session.last_ack_window = tcph[6] # slide 78, 88 chapter 3: trường window trong TCP header đã đc kiểm tra, hỗ trợ khởi tạo state để nhận diện duplicate ACK
                                 session.client_seq = (pkt_seq + len(app_payload)) & M32
                                 if len(app_payload) > 0:
                                     session.recv_buffer.extend(app_payload)
@@ -788,6 +793,7 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                         session.state = "ESTABLISHED"
                         session.server_seq = pkt_ack
                         session.send_base = pkt_ack
+                        session.last_ack_window = tcph[6]
                         session.client_seq = (pkt_seq + len(app_payload)) & M32
                         if len(app_payload) > 0:
                             session.recv_buffer.extend(app_payload)
@@ -1146,16 +1152,27 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
         session = connections[client_key]
     
     total = 0
-    with session.cv:
-        start_seq = session.server_seq
 
     try:
+        # slide 103, 104 chapter 3: CLOSE_WAIT vẫn cho phép gửi
+        with session.cv:
+            if session.error is not None:
+                return -1
+            if session.state not in ("ESTABLISHED", "CLOSE_WAIT"):
+                raise ConnectionError("Trạng thái connection không cho phép gửi dữ liệu mới")
+            start_seq = session.server_seq
+
         # server_seq dùng để biểu diễn sequence dành cho byte dữ liệu mới tiếp theo (chapter 3 tương ứng với NextSeqNum)
         for chunk in split_into_segments(payload):  # slide 77 chapter 3 chia dữ liệu theo MSS)
+            # wait_for_ack(s, session, start_seq, None, session.unacked, session.rtt, session.client_seq) # kiểm tra timeout/fast retransmit giữa các segment.
             with session.cv:
                 if session.error is not None:
                     return -1
-                segment_seq = session.server_seq   # slide 78, 79 chapter 3 seq đánh số byte đầu trong segment
+                if session.state not in ("ESTABLISHED", "CLOSE_WAIT"):
+                    raise ConnectionError("Chiều gửi bắt đầu đóng")
+                
+                # slide 78, 79 chapter 3: seq đánh số byte đầu trong segment
+                segment_seq = session.server_seq
                 sent_at = time.monotonic()
 
                 send_tcp_data_segment(
@@ -1165,14 +1182,14 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
 
                 session.unacked.append(OutstandingSegment(seq=segment_seq, payload=chunk, first_sent_at=sent_at, last_sent_at=sent_at)) # slide 79, 146 chapter 3: giữ dữ liệu chưa ACK để có thể gửi lại
                 session.server_seq = (segment_seq + len(chunk)) & M32    # slide 146 chapter 3: NextSeqNum = NextSeqNum + length(data)
+                session.last_activity = time.time()
                 if session.timer_deadline is None: 
                     session.timer_deadline = sent_at + session.rtt.rto  # slide 84, 146 chapter 3: khởi động timer nếu chưa chạy
-            
-            total += len(chunk)    
+            total += len(chunk)
+
         with session.cv:
             target_seq = session.server_seq # ACK phải tiến đến mốc này để xác nhận hết lần gửi
             ack_seq = session.client_seq
-    
         print(f"[Streap_raw] run_conn_send Sent {total} bytes in segments to {client_ip}:{client_port}")
         last_byte_acked, all_acked = wait_for_ack(s, session, start_seq, target_seq, session.unacked, session.rtt, ack_seq)   # start_seq into wait_for_ack()
 
@@ -1218,6 +1235,8 @@ def close_connection(s: socket.socket, conn_info: conn_struct):
                 connections.pop(client_key, None)
             remove_packet_queue(client_key)
             return
+        if session.unacked or session.send_base != session.server_seq: # slide 103, 104 chapter 3: phương án nhóm chọn là hoàn tất ACK dữ liệu trước khi phát FIN
+            raise RuntimeError("Cần hoàn tất dữ liệu đang chờ ACK trước khi bắt đầu FIN")
         fin_seq = session.server_seq
         expected_fin_ack = (fin_seq + 1) & M32
         session.server_seq = expected_fin_ack
