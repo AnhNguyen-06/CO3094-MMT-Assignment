@@ -19,6 +19,7 @@ Based on raw_connection_server.py implementation.
 Provides connection management, send/receive functionality using raw sockets.
 """
 
+from curses import window
 import socket
 import struct
 import sys
@@ -60,6 +61,7 @@ DEFAULT_INTERFACE_NAME = "lo0"
 # Reliability helpers
 # ---------------------------------------------------------------------------
 MSS = 1460
+DEFAULT_RCV_BUFFER = 65535 #ngang với rwnd 2 mũ 16 -1 = 65535 (slide 3-78)
 M32 = 0xFFFFFFFF
 
 def seq_diff(a, b):
@@ -124,7 +126,8 @@ def on_ack(conn, segment, received_at):
         progress = seq_diff(ack, conn.send_base)
         if progress < 0:
             return "old"
-        elif progress == 0:
+        conn.peer_rwnd = segment.window   # flow control (slide 3-94/3-95): ghi nhớ window peer quảng bá
+        if progress == 0:
             conn.last_activity = time.time()
             pure_ack = (not segment.payload and not (segment.flags & 0x07)) # ko có SYN/RST/FIN
             same_window = segment.window == conn.last_ack_window
@@ -225,16 +228,21 @@ class conn_struct:
         self.retry_count = 0
         self.fast_retransmit_pending = False
         self.last_ack_window = None
-
+        self.peer_rwnd = 65535   # rwnd của peer = window nó quảng bá gần nhất, 2 mũ 16 -1 = 65535 (slide 3-78)
         # Khóa đồng bộ dùng chung
         self.cv = threading.Condition()
         self.send_lock = threading.Lock()
 
         # Các trường phía receiver
         self.recv_buffer = bytearray()
+        self.rcv_buffer_size = DEFAULT_RCV_BUFFER   # RcvBuffer: dung lượng tối đa, ngang với max rwnd (slide 3-94)
+        
         self.peer_eof = False
         self.error = None
-
+    def get_rwnd(self):
+        """rwnd = RcvBuffer - số byte còn nằm trong buffer chưa được app đọc (slide 3-94, 3-95), kẹp trong 16 bit."""
+        with self.cv:
+            return max(0, min(self.rcv_buffer_size - len(self.recv_buffer), 0xFFFF))
     def _replace(self, **kwargs):
         with self.cv:
             for k, v in kwargs.items():
@@ -252,6 +260,12 @@ def classify_segment(rcv_next, seq, length):
             return "duplicate" # toàn bộ các byte trong gói đã nhận trước đó (3-52, 3-61)
         return "partial_overlap" # phần đầu (-d bytes) trùng, phần đuôi là byte mới từ rcv_next (3-78, 3-79)
     return "gap" # d>0: gói đến sớm hơn rcv_next, có gap (3-68, 3-85)
+
+def send_budget(conn):
+    """Số byte MỚI sender còn được phép gửi ngay lúc này .
+    in_flight = NextSeqNum - SendBase; budget = peer_rwnd - in_flight (slide 3-94, 3-95)."""
+    in_flight = seq_diff(conn.server_seq, conn.send_base)
+    return max(0, conn.peer_rwnd - in_flight)
 
 def register_keep_port_alive(listen_ip="0.0.0.0", listen_port=22239, retry_interval=10):
     """
@@ -350,7 +364,7 @@ def verify_tcp_checksum(packet):
     pseudo = packet[12:16] + packet[16:20] + struct.pack('!BBH', 0, socket.IPPROTO_TCP, len(tcp))
     return checksum(pseudo + tcp) == 0 # kiểm tra tổng kiểm 16-bit bù 1 (Slide 3-31..3-34, 3-44)
 
-def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, ack=0, fin=0):
+def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, ack=0, fin=0, window=None):
     """Stitches a structurally flawless 20-byte TCP header.
 
     Args:
@@ -366,7 +380,9 @@ def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, a
     """
     flags = (ack << 4) + (syn << 1) + fin
     offset_res = (5 << 4) + 0  # 20 bytes data offset (5 * 4)
-    window = 5840
+    if window is None:
+        window = DEFAULT_RCV_BUFFER  # chưa có session (vd SYN-ACK): quảng bá buffer mặc định
+    window = max(0, min(window, 0xFFFF))  # trường window của TCP dài 16 bit (slide 3-78)
     urg_ptr = 0
     draft_checksum = 0
 
@@ -437,7 +453,7 @@ def build_ip_header(src_ip, dest_ip, protocol, payload_len):
     return ip_header
 
 
-def send_tcp_data_segment(s, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, payload):
+def send_tcp_data_segment(s, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, payload, window=None):
     """Assembles and transmits a single TCP segment containing data payload.
 
     Args:
@@ -458,7 +474,9 @@ def send_tcp_data_segment(s, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, 
     #       need to modify in full schema
     flags = 0x18
     offset_res = (5 << 4) + 0
-    window = 5840
+    if window is None:
+        window = DEFAULT_RCV_BUFFER  # chưa có session (vd SYN-ACK): quảng bá buffer mặc định
+    window = max(0, min(window, 0xFFFF))  # trường window của TCP dài 16 bit (slide 3-78)
     urg_ptr = 0
     draft_checksum = 0
     
@@ -495,6 +513,17 @@ def send_tcp_data_segment(s, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, 
     s.sendto(full_packet, (dest_ip, 0))
     
     return len(payload)
+
+def send_pure_ack(s, session, ack_seq=None):
+    """Gửi ACK thuần (không có data) mang window nhận hiện tại"""
+    with session.cv:
+        ack_value = session.client_seq if ack_seq is None else ack_seq
+        window = session.get_rwnd()
+        seq = session.server_seq
+    pkt = build_tcp_packet(session.server_ip, session.client_ip, session.server_port, session.client_port, seq=seq, ack_seq=ack_value, ack=1, window=window)
+    ip_header = build_ip_header(session.server_ip, session.client_ip, socket.IPPROTO_TCP, len(pkt))
+    s.sendto(ip_header + pkt, (session.client_ip, 0))
+    return window
 
 
 def clean_expired_connections(timeout=60):
@@ -757,13 +786,14 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                                 session.server_seq = pkt_ack
                                 session.send_base = pkt_ack
                                 session.last_ack_window = tcph[6] # slide 78, 88 chapter 3: trường window trong TCP header đã đc kiểm tra, hỗ trợ khởi tạo state để nhận diện duplicate ACK
+                                session.peer_rwnd = tcph[6]   # flow control (slide 3-95): window ban đầu từ ACK cuối bắt tay
                                 session.client_seq = (pkt_seq + len(app_payload)) & M32
                                 if len(app_payload) > 0:
                                     session.recv_buffer.extend(app_payload)
                                 session.last_activity = time.time()
                         
                         if len(app_payload) > 0:
-                            ack_packet = build_tcp_packet(send_ip, client_ip, listen_port, client_port, seq=session.server_seq, ack_seq=session.client_seq, ack=1)
+                            ack_packet = build_tcp_packet(send_ip, client_ip, listen_port, client_port, seq=session.server_seq, ack_seq=session.client_seq, ack=1, window=session.get_rwnd())
                             ip_header = build_ip_header(send_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
                             s.sendto(ip_header + ack_packet, (client_ip, 0))
                         with handshake_lock:
@@ -795,13 +825,14 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                         session.server_seq = pkt_ack
                         session.send_base = pkt_ack
                         session.last_ack_window = tcph[6]
+                        session.peer_rwnd = tcph[6]
                         session.client_seq = (pkt_seq + len(app_payload)) & M32
                         if len(app_payload) > 0:
                             session.recv_buffer.extend(app_payload)
                         session.last_activity = time.time()
                     
                 if len(app_payload) > 0:
-                    ack_packet = build_tcp_packet(send_ip, client_ip, listen_port, client_port, seq=session.server_seq, ack_seq=session.client_seq, ack=1)
+                    ack_packet = build_tcp_packet(send_ip, client_ip, listen_port, client_port, seq=session.server_seq, ack_seq=session.client_seq, ack=1, window=session.get_rwnd())
                     ip_header = build_ip_header(send_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
                     s.sendto(ip_header + ack_packet, (client_ip, 0))
                     
@@ -948,26 +979,21 @@ def run_conn_recv(s: socket.socket, session: conn_struct) -> bytes:
                         app_payload = app_payload[overlap_bytes:]
                         print(f"[Streap_raw] run_conn_recv: partial_overlap seq={pkt_seq}, trimmed {overlap_bytes}B, kept {len(app_payload)}B")
                     elif kind != "in_order":
-                        print(f"[Streap_raw] run_conn_recv: {kind} seq={pkt_seq}, expected={session.client_seq} -> dup ACK")
-                        dup_ack = build_tcp_packet(session.server_ip, client_ip, listen_port, client_port, seq=session.server_seq, ack_seq=session.client_seq, ack=1)
-                        ip_header = build_ip_header(session.server_ip, client_ip, socket.IPPROTO_TCP, len(dup_ack))
-                        s.sendto(ip_header + dup_ack, (client_ip, 0))
+                        send_pure_ack(s, session)   # dup ACK: cùng ack number, window hiện tại
                         continue
-                    next_ack = (session.client_seq + len(app_payload)) & M32       
-
-                    ack_packet = build_tcp_packet(session.server_ip, client_ip, listen_port, client_port,
-                                                  seq=session.server_seq, ack_seq=next_ack, ack=1)
-                    ip_header = build_ip_header(session.server_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
-                    s.sendto(ip_header + ack_packet, (client_ip, 0))
-                    print(f"[Streap_raw] Sent ACK for data (Ack={next_ack})")
-                    
-                    # Update sequence numbers AFTER ACK sent
-                    with session.cv:
+                    # flow control (slide 3-94): từ chối byte không vừa buffer nhận
+                    if len(app_payload) > session.get_rwnd():
+                        print(f"[Streap_raw] run_conn_recv: no room in receive buffer (rwnd={session.get_rwnd()}), not accepted")
+                        send_pure_ack(s, session)
+                        continue
+                    next_ack = (session.client_seq + len(app_payload)) & M32   
+                    with session.cv: # lưu trước để window quảng bá đã tính các byte vừa nhận
                         session.client_seq = next_ack
                         session.recv_buffer.extend(app_payload)
                         session.last_activity = time.time()
                         session.cv.notify_all()
-            
+                    window = send_pure_ack(s, session)
+                    print(f"[Streap_raw] Sent ACK for data (Ack={next_ack}, window={window})")
             # Handle FIN (connection close)
             if fin_flag:
                 print(f"[Streap_raw] Received FIN from {client_ip}:{client_port}")
@@ -978,11 +1004,7 @@ def run_conn_recv(s: socket.socket, session: conn_struct) -> bytes:
                     if session.state == "ESTABLISHED":
                         session.state = "CLOSE_WAIT"
                     session.cv.notify_all()
-                # Send ACK for FIN
-                ack_packet = build_tcp_packet(listen_ip, client_ip, listen_port, client_port,
-                                              seq=session.server_seq, ack_seq=fin_ack, ack=1)
-                ip_header = build_ip_header(listen_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
-                s.sendto(ip_header + ack_packet, (client_ip, 0))
+                send_pure_ack(s, session, ack_seq=fin_ack)
 
     except KeyboardInterrupt:
         print("\n[Streap_raw] Receive loop interrupted.")
@@ -991,7 +1013,7 @@ def run_conn_recv(s: socket.socket, session: conn_struct) -> bytes:
         print(f"[Streap_raw] Error in run_conn_recv: {e}")
         return b""
 
-def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq):
+def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq, need=None):
     """Wait for the client to ACK up to the last byte of the response, and retransmit lost segments.
 
     Returns (last_byte_acked, all_acked).
@@ -1030,7 +1052,7 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq):
         send_tcp_data_segment(
             s, conn_info.server_ip, conn_info.client_ip,
             conn_info.server_port, conn_info.client_port,
-            seq=seg_seq, ack_seq=conn_info.client_seq, payload=seg_chunk
+            seq=seg_seq, ack_seq=conn_info.client_seq, payload=seg_chunk, window=conn_info.get_rwnd()
         )
         record.last_sent_at = sent_at   # thời điểm gửi gần nhất
         record.retransmitted = True
@@ -1046,6 +1068,8 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq):
                 return last_byte_acked, False
             if seq_diff(conn_info.send_base, target) >= 0:
                 return last_byte_acked, True
+            if need is not None and send_budget(conn_info) >= need:
+                return last_byte_acked, False # flow control (slide 3-95): window đã mở, caller có thể gửi thêm byte cần gửi
             if not unacked or conn_info.timer_deadline is None:
                 raise RuntimeError("Chưa đạt mốc ACK nhưng buffer hoặc timer không hợp lệ")
             rto = rtt.rto
@@ -1164,29 +1188,48 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
             start_seq = session.server_seq
 
         # server_seq dùng để biểu diễn sequence dành cho byte dữ liệu mới tiếp theo (chapter 3 tương ứng với NextSeqNum)
-        for chunk in split_into_segments(payload):  # slide 77 chapter 3 chia dữ liệu theo MSS)
-            # wait_for_ack(s, session, start_seq, None, session.unacked, session.rtt, session.client_seq) # kiểm tra timeout/fast retransmit giữa các segment.
+        offset = 0
+        while offset < len(payload):
             with session.cv:
                 if session.error is not None:
                     return -1
                 if session.state not in ("ESTABLISHED", "CLOSE_WAIT"):
                     raise ConnectionError("Chiều gửi bắt đầu đóng")
                 
-                # slide 78, 79 chapter 3: seq đánh số byte đầu trong segment
-                segment_seq = session.server_seq
-                sent_at = time.monotonic()
+                # flow control (slide 3-94, 3-95): không để quá peer_rwnd byte đang bay
+                in_flight = seq_diff(session.server_seq, session.send_base)
+                budget = send_budget(session)
+                want = min(MSS, len(payload) - offset)      # slide 77 chapter 3: chia theo MSS
+                if budget >= want:
+                    n = want
+                elif in_flight == 0:
+                    n = max(budget, 1)   # không có gì đang bay: gửi phần vừa chỗ, hoặc 1 byte thăm dò khi window = 0
+                else:
+                    n = 0                # window đầy: chờ ACK / window update
 
-                send_tcp_data_segment(
-                    s, listen_ip, client_ip, listen_port, client_port,
-                    seq=segment_seq, ack_seq=session.client_seq, payload=chunk
-                )
+                if n > 0:
+                    chunk = payload[offset:offset + n]
+                    # slide 78, 79 chapter 3: seq đánh số byte đầu trong segment
+                    segment_seq = session.server_seq
+                    sent_at = time.monotonic()
 
-                session.unacked.append(OutstandingSegment(seq=segment_seq, payload=chunk, first_sent_at=sent_at, last_sent_at=sent_at)) # slide 79, 146 chapter 3: giữ dữ liệu chưa ACK để có thể gửi lại
-                session.server_seq = (segment_seq + len(chunk)) & M32    # slide 146 chapter 3: NextSeqNum = NextSeqNum + length(data)
-                session.last_activity = time.time()
-                if session.timer_deadline is None: 
-                    session.timer_deadline = sent_at + session.rtt.rto  # slide 84, 146 chapter 3: khởi động timer nếu chưa chạy
-            total += len(chunk)
+                    send_tcp_data_segment(
+                        s, listen_ip, client_ip, listen_port, client_port,
+                        seq=segment_seq, ack_seq=session.client_seq, payload=chunk, window=session.get_rwnd()
+                    )
+
+                    session.unacked.append(OutstandingSegment(seq=segment_seq, payload=chunk, first_sent_at=sent_at, last_sent_at=sent_at)) # slide 79, 146 chapter 3: giữ dữ liệu chưa ACK để có thể gửi lại
+                    session.server_seq = (segment_seq + len(chunk)) & M32    # slide 146 chapter 3: NextSeqNum = NextSeqNum + length(data)
+                    session.last_activity = time.time()
+                    if session.timer_deadline is None:
+                        session.timer_deadline = sent_at + session.rtt.rto  # slide 84, 146 chapter 3: khởi động timer nếu chưa chạy
+
+            if n == 0:
+                # trong lúc chờ vẫn có RTO / fast retransmit; trả về khi window đủ chỗ cho `want` byte
+                wait_for_ack(s, session, start_seq, session.server_seq, session.unacked, session.rtt, session.client_seq, need=want)
+                continue
+            offset += n
+            total += n
 
         with session.cv:
             target_seq = session.server_seq # ACK phải tiến đến mốc này để xác nhận hết lần gửi
@@ -1255,7 +1298,7 @@ def close_connection(s: socket.socket, conn_info: conn_struct):
     def send_fin():
         with session.cv:
             cur_ack = session.client_seq
-        fin_pkt = build_tcp_packet(listen_ip, client_ip, listen_port, client_port, seq=fin_seq, ack_seq=cur_ack, ack=1, fin=1)
+        fin_pkt = build_tcp_packet(listen_ip, client_ip, listen_port, client_port, seq=fin_seq, ack_seq=cur_ack, ack=1, fin=1, window=session.get_rwnd())
         ip_hdr = build_ip_header(listen_ip, client_ip, socket.IPPROTO_TCP, len(fin_pkt))
         s.sendto(ip_hdr + fin_pkt, (client_ip, 0))
         print(f"[Streap_raw] close_connection: Sent FIN (Seq={fin_seq}, Ack={cur_ack}, state={session.state})")
@@ -1320,7 +1363,7 @@ def close_connection(s: socket.socket, conn_info: conn_struct):
                 session.client_seq = fin_ack_num
                 session.peer_eof = True
                 session.state = "TIMED_WAIT" if fin_acked else "CLOSING"
-            ack_pkt = build_tcp_packet(listen_ip, client_ip, listen_port, client_port, seq=session.server_seq, ack_seq=fin_ack_num, ack=1)
+            ack_pkt = build_tcp_packet(listen_ip, client_ip, listen_port, client_port, seq=session.server_seq, ack_seq=fin_ack_num, ack=1, window=session.get_rwnd())
             ip_hdr = build_ip_header(listen_ip, client_ip, socket.IPPROTO_TCP, len(ack_pkt))
             s.sendto(ip_hdr + ack_pkt, (client_ip, 0))
             if fin_acked:
