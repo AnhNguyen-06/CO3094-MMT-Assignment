@@ -1,0 +1,96 @@
+RAW TCP FILE TRANSFER / CO3094
+============================
+
+Use the same project revision on both Linux machines. This tool uses the
+existing streaprous_socket raw TCP transport, not HTTP or UDP. It does not
+need start_backend.py. Each invocation transfers one file, then exits.
+Use separate processes to transfer in the opposite direction.
+
+Files to copy to both machines:
+  transfer_file.py
+  streaprous_socket/ (all Python modules, same revision)
+  test_data/ (two sample files and SHA256SUMS.txt)
+Copying the complete project is easiest. No need to copy __pycache__.
+Prerequisites: Python 3, netifaces (available to sudo python3), iptables.
+On Ubuntu: sudo apt update && sudo apt install python3-netifaces iptables
+
+Samples:
+  test_data/payload_50KiB.bin   = 51,200 bytes
+  test_data/payload_100KiB.bin  = 102,400 bytes
+  cd test_data && sha256sum -c SHA256SUMS.txt
+
+Run commands below from the project root. Example:
+  machine A (sender):   192.168.1.30
+  machine B (receiver): 192.168.1.28
+Replace addresses with real LAN addresses. Two bridged VMs on the same LAN
+are convenient. The LAN/firewall must allow TCP port 9001 to the receiver
+and return traffic to the sender. Client source port defaults to 22240.
+
+1. NORMAL TRANSFER
+On B, start the receiver first:
+  sudo python3 -u transfer_file.py receive --listen-ip 192.168.1.28
+On A, choose one of the sample files interactively:
+  sudo python3 -u transfer_file.py send --peer-ip 192.168.1.28
+Or specify a path:
+  sudo python3 -u transfer_file.py send --peer-ip 192.168.1.28 --file test_data/payload_100KiB.bin
+If automatic source interface selection is wrong, append --interface enp0s3
+(use the actual NIC name from `ip a`) on the sender.
+
+Both sides print SUCCESS only after size/SHA-256 validation and an application
+receipt. Receiver saves a uniquely named file in received_files/ (configurable
+with --output). Size-prefixed metadata and exact-length reads handle arbitrary
+TCP segmentation; one recv call is NOT assumed to contain a complete file.
+These binary files are arbitrary reproducible data; view them with xxd, not cat.
+
+2. FLOW CONTROL (small receive buffer and slow application reads)
+Restart B with:
+  sudo python3 -u transfer_file.py receive --listen-ip 192.168.1.28 --recv-buffer 8192 --hold 2 --read-size 1024 --read-delay 0.05
+On A, send payload_100KiB.bin again.
+After signalling READY, the receiver application pauses for 2 seconds while
+the transport continues buffering/ACKing incoming bytes. Advertised Win should
+shrink, potentially to zero; subsequent application reads reopen the window.
+Look for persist/probe logs and Win updates, and final SHA-256 SUCCESS.
+The sender continues to obey both peer_rwnd and cwnd in the existing transport.
+
+3. RELIABILITY / CONGESTION WITH CONTROLLED NETWORK IMPAIRMENT (optional)
+An ordinary successful transfer checks integrity, but does not demonstrate
+recovery from loss. On a dedicated test VM, use Linux tc/netem to inject loss
+and delay on the sender's network NIC. This affects all outgoing traffic on
+that NIC, including SSH. Use the VM console and record existing qdiscs first:
+  tc qdisc show dev enp0s3
+If there is already a custom root qdisc, preserve its configuration instead of
+replacing it with these examples. Install iproute2 if tc is unavailable.
+
+On A, before a fresh NORMAL transfer (no small buffer/slow receiver):
+  sudo tc qdisc add dev enp0s3 root netem delay 40ms loss 2% rate 2mbit
+  sudo python3 -u transfer_file.py send --peer-ip 192.168.1.28 --file test_data/payload_100KiB.bin 2>&1 | tee transfer_loss.log
+After the experiment, remove ONLY the netem qdisc you added:
+  sudo tc qdisc del dev enp0s3 root
+Replace enp0s3 with the actual sender NIC. Start B before sending, as above.
+Repeat if random loss does not hit a data segment. Too much loss can also
+prevent the handshake. Do not configure traffic impairment automatically.
+
+Observe transport timeout/retransmission or duplicate-ACK/fast-retransmit logs,
+and CUBIC cwnd, ssthresh, phase transitions. Final SHA-256 must still match.
+To isolate cases: use delay/rate without loss to study growth, then introduce
+loss; use the small-buffer setup separately to study flow control.
+50/100 KiB can show initial slow start and loss recovery but are too short to
+guarantee sustained CUBIC congestion avoidance or a steady-state curve.
+For longer experiments --file accepts arbitrary regular files up to 16 MiB.
+
+4. REVERSE DIRECTION
+Start receive on A with --listen-ip 192.168.1.30, then send on B with
+--peer-ip 192.168.1.30. Restart the receiver for each new transfer.
+
+Operational notes:
+- RST blocking is installed for the local port only if absent and removed
+  on normal exit/errors/Ctrl+C. SIGKILL cannot run cleanup. Do not run multiple
+  copies sharing the same local port.
+- Transport currently sends FIN and removes session state immediately;
+  this tool does not implement a full TCP closing state machine. A late ACK
+  can log 'no queue' after verified completion.
+- Handshake has transport retries; application receive has no overall deadline.
+  If the peer disappears mid-transfer, Ctrl+C stops the waiting process.
+- This is a small file lab tool: file payload is held in memory (max 16 MiB).
+- A local test of framing/integrity is separate from real raw-socket tests:
+  verify the latter on your two machines with the commands above.

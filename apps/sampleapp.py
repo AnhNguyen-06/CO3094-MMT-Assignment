@@ -24,7 +24,7 @@ import os
 import importlib.util
 import json
 
-from   daemon import StreapRous
+from daemon import StreapRous
 
 app = StreapRous()
 

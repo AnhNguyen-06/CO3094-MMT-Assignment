@@ -80,8 +80,8 @@ class Request():
 
             if path == '/':
                 path = '/index.html'
-        except Exception:
-            return None, None
+        except (IndexError, ValueError):
+            return None, None, None
 
         return method, path, version
              
@@ -112,17 +112,16 @@ class Request():
         self.method, self.path, self.version = self.extract_request_line(request)
         print("[Request] {} path {} version {}".format(self.method, self.path, self.version))
 
-        #
-        # TODO:  Parse headers and body 
-        # with self.fetch_headers_body(request)
-        # and self.prepare_headers(self._raw_headers)
-        #
 
-        # self._raw_headers = ... 
-        # self._raw_body =...
-        # self.headers = ...
-        
-        self.prepare_headers(self._raw_headers)
+        if self.method is None:
+            raise ValueError("Invalid HTTP request line")
+
+        print("[Request] {} path {} version {}".format(
+            self.method, self.path, self.version
+        ))
+    
+        self._raw_headers, self._raw_body = self.fetch_headers_body(request)
+        self.headers = self.prepare_headers(self._raw_headers)
         print("[Request] Parsed headers: {}".format(self.headers))
 
         #
@@ -132,7 +131,7 @@ class Request():
         # TODO manage the webapp hook in this mounting point
         #
         
-        if not routes == {}:
+        if routes:
             self.routes = routes
             print("[Request] Routing METHOD {} path {}".format(self.method, self.path))
             self.hook = routes.get((self.method, self.path))
