@@ -60,7 +60,7 @@ DEFAULT_INTERFACE_NAME = "lo0"
 # Reliability helpers
 # ---------------------------------------------------------------------------
 MSS = 1460
-DEFAULT_RCV_BUFFER = 65535   # dung lượng buffer nhận, cũng là max của trường window 16 bit (slide 3-78)
+DEFAULT_RCV_BUFFER = 4096   # dung lượng buffer nhận(slide 3-95)
 M32 = 0xFFFFFFFF
 
 def seq_diff(a, b):
@@ -77,6 +77,7 @@ BETA = 0.25         # weight of the new sample in DevRTT
 INITIAL_RTO = 1.0   # seconds, used when no RTT samples are available
 MIN_RTO = 0.2       # seconds, lower bound (RTT in LAN networks is very small)
 MAX_RTO = 10.0      # seconds, upper bound
+PERSIST_MAX = 1.0   # giây, khoảng cách tối đa giữa 2 probe zero-window (ngoài slide; cần vì chưa có window update khi app đọc)
 MAX_RETRIES = 5     # maximum number of consecutive retransmissions before giving up
 
 class RttEstimator:
@@ -107,6 +108,7 @@ class OutstandingSegment:
     first_sent_at: float
     last_sent_at: float
     retransmitted: bool = False
+    probe: bool = False   # flow control (ngoài slide): gói thăm dò zero-window, có chính sách chờ riêng (persist), không tính vào retry của DATA
 
 # hàm mới cùng các biến đã thống nhất với sender
 def on_ack(conn, segment, received_at):
@@ -125,12 +127,22 @@ def on_ack(conn, segment, received_at):
         progress = seq_diff(ack, conn.send_base)
         if progress < 0:
             return "old"
-        conn.peer_rwnd = segment.window   # flow control (slide 3-94/3-95): ghi nhớ window peer quảng bá; ACK cũ đã return ở trên
+        conn.probe_unanswered = 0         # có ACK từ peer -> peer còn sống (dùng cho persist probe)
+        # flow control (slide 3-94/3-95): ghi nhớ window peer quảng bá; ACK cũ đã return ở trên.
+        # Chỉ nhận window từ segment "mới hơn" theo RFC 793 (SND.WL1/WL2): seq lớn hơn, hoặc cùng seq và ack không nhỏ hơn.
+        # Hai update cùng (seq, ack) không phân biệt được thứ tự -> chấp nhận như TCP thật; probe định kỳ sẽ sửa nếu giá trị cũ bị ghi đè.
+        fresh_window = (conn.peer_window_seq is None
+                        or seq_diff(segment.seq, conn.peer_window_seq) > 0
+                        or (segment.seq == conn.peer_window_seq and seq_diff(ack, conn.peer_window_ack) >= 0))
+        if fresh_window:
+            conn.peer_rwnd = segment.window
+            conn.peer_window_seq = segment.seq
+            conn.peer_window_ack = ack
         if progress == 0:
             conn.last_activity = time.time()
             pure_ack = (not segment.payload and not (segment.flags & 0x07)) # ko có SYN/RST/FIN
             same_window = segment.window == conn.last_ack_window
-            if conn.unacked and pure_ack and same_window:
+            if conn.unacked and pure_ack and same_window and not conn.unacked[0].probe:
                 conn.dup_ack_count += 1
                 if conn.dup_ack_count == 3:
                     conn.fast_retransmit_pending = True # slide 88 chapter 3: 3 duplicate ACK cần fast retransmit
@@ -227,7 +239,10 @@ class conn_struct:
         self.retry_count = 0
         self.fast_retransmit_pending = False
         self.last_ack_window = None
-        self.peer_rwnd = 65535   # rwnd của peer = window nó quảng bá gần nhất, tối đa 65535 (slide 3-78, 3-94/3-95)
+        self.peer_window_seq = None   # seq/ack của segment đã dùng để đặt peer_rwnd (RFC 793 SND.WL1/WL2)
+        self.peer_window_ack = None
+        self.probe_unanswered = 0 # số lần gửi probe liên tiếp mà không nhận ACK nào
+        self.peer_rwnd = 65535   # rwnd của peer = window nó quảng bá gần nhất (byte), tối đa 65535 (slide 3-78, 3-94/3-95)
 
         # Khóa đồng bộ dùng chung
         self.cv = threading.Condition()
@@ -517,12 +532,13 @@ def send_tcp_data_segment(s, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, 
 
 
 def send_pure_ack(s, session, ack_seq=None):
-    """Gửi ACK thuần (không có data) mang window nhận hiện tại (slide 3-77/3-78: trường window; 3-94/3-95: rwnd)."""
+    """Gửi ACK thuần (không data) mang window nhận HIỆN TẠI của ta (slide 3-77/3-78: trường window; 3-94/3-95: rwnd)."""
     with session.cv:
         ack_value = session.client_seq if ack_seq is None else ack_seq
         window = session.get_rwnd()
         seq = session.server_seq
-    pkt = build_tcp_packet(session.server_ip, session.client_ip, session.server_port, session.client_port, seq=seq, ack_seq=ack_value, ack=1, window=window)
+    pkt = build_tcp_packet(session.server_ip, session.client_ip, session.server_port, session.client_port,
+                           seq=seq, ack_seq=ack_value, ack=1, window=window)
     ip_header = build_ip_header(session.server_ip, session.client_ip, socket.IPPROTO_TCP, len(pkt))
     s.sendto(ip_header + pkt, (session.client_ip, 0))
     return window
@@ -1084,14 +1100,18 @@ def run_conn_recv(s: socket.socket, session: conn_struct) -> bytes:
         if start_only:
             return b""
     try:
+        data = b""
         with session.cv:
             while len(session.recv_buffer) == 0 and not session.peer_eof and session.error is None and session.state != "CLOSED":
                 session.cv.wait(timeout=0.5)
             if len(session.recv_buffer) > 0:
                 data = bytes(session.recv_buffer)
                 session.recv_buffer.clear()
-                return data
-            return b""
+            closed = session.state == "CLOSED" or session.error is not None
+        if data and not closed:
+            # app đã đọc -> buffer có chỗ trống: báo window mới cho peer (slide 3-94: rwnd = chỗ trống; cơ chế gửi chủ động là ngoài slide)
+            send_pure_ack(s, session)
+        return data
 
     except KeyboardInterrupt:
         print("\n[Streap_raw] Receive loop interrupted.")
@@ -1179,8 +1199,30 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq, need=None):
             deadline = conn_info.timer_deadline
             left = deadline - time.monotonic()
 
+            # flow control (ngoài slide): window đã mở lại trong khi probe còn chờ -> gửi lại byte đó ngay, rồi coi như DATA thường
+            if unacked and unacked[0].probe and conn_info.peer_rwnd > 0:
+                unacked[0].probe = False
+                conn_info.probe_unanswered = 0
+                retransmit_oldest("window mở lại, gửi lại byte đang chờ")
+                if poll_only:
+                    return last_byte_acked, False
+                continue
             # slide 84, 146 chapter 3
             if left <= 0:                            # RTO expired
+                # flow control (ngoài slide): gói đầu hàng đợi là probe zero-window -> chính sách persist riêng
+                if unacked and unacked[0].probe:
+                    conn_info.probe_unanswered += 1
+                    if conn_info.probe_unanswered > MAX_RETRIES:       # peer không trả lời probe nào -> coi như chết
+                        print(f"[Streap_raw] wait_for_ack: GIVE UP, zero-window probe không được peer trả lời")
+                        conn_info.error = TimeoutError("Peer không phản hồi gói thăm dò zero-window")
+                        conn_info.timer_deadline = None
+                        conn_info.cv.notify_all()
+                        return last_byte_acked, False
+                    retransmit_oldest("zero-window probe (persist)")   # không tăng retry_count/RTO của DATA
+                    conn_info.timer_deadline = time.monotonic() + min(max(rto * 2, 0.05), PERSIST_MAX)
+                    if poll_only:
+                        return last_byte_acked, False
+                    continue
                 # phần xử lý timeout
                 if retries >= MAX_RETRIES:
                     print(f"[Streap_raw] wait_for_ack: GIVE UP after {retries} retransmissions, last_byte_acked={last_byte_acked}")
@@ -1330,7 +1372,7 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                         seq=segment_seq, ack_seq=session.client_seq, payload=chunk, window=session.get_rwnd()
                     )
 
-                    session.unacked.append(OutstandingSegment(seq=segment_seq, payload=chunk, first_sent_at=sent_at, last_sent_at=sent_at)) # slide 79, 146 chapter 3: giữ dữ liệu chưa ACK để có thể gửi lại
+                    session.unacked.append(OutstandingSegment(seq=segment_seq, payload=chunk, first_sent_at=sent_at, last_sent_at=sent_at, probe=(budget == 0))) # slide 79, 146 chapter 3: giữ dữ liệu chưa ACK để có thể gửi lại
                     session.server_seq = (segment_seq + len(chunk)) & M32    # slide 146 chapter 3: NextSeqNum = NextSeqNum + length(data)
                     session.last_activity = time.time()
                     if session.timer_deadline is None:
