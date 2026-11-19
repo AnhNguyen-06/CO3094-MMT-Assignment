@@ -105,7 +105,6 @@ class OutstandingSegment:
     seq: int
     payload: bytes
     first_sent_at: float
-    last_sent_at: float
     retransmitted: bool = False
 
 # hàm mới cùng các biến đã thống nhất với sender
@@ -146,18 +145,13 @@ def on_ack(conn, segment, received_at):
         while conn.unacked:
             record = conn.unacked[0]
             ack_bytes = seq_diff(ack, record.seq)
-            if ack_bytes <= 0:
+            if ack_bytes < len(record.payload):
                 break
-            if record.retransmitted: # đánh dấu để loại mẫu RTT
+            conn.unacked.popleft()
+            if record.retransmitted:
                 ack_retransmission = True
-            if ack_bytes >= len(record.payload):
-                conn.unacked.popleft() # record đã đủ nên cần giải phóng bớt dữ liệu đã ACK kể cả khi record từng được gửi lại
-                if not record.retransmitted:
-                    rtt_sample = received_at - record.first_sent_at
             else:
-                record.payload = record.payload[ack_bytes:] # bỏ prefix đã ACK
-                record.seq = ack
-                break
+                rtt_sample = received_at - record.first_sent_at
 
         conn.send_base = ack # slide 146 chapter 3: send_base = y
         conn.last_activity = time.time()
@@ -344,24 +338,24 @@ def verify_tcp_checksum(packet):
     Chapter 3 (Slide 3-31..3-34, 3-78: Internet checksum & TCP segment structure).
     """
     if not isinstance(packet, (bytes, bytearray)) or len(packet) < 40: # gói IPv4 + TCP tối thiểu 40 bytes (Slide 4-43, 3-78)
-        return False
+        return None
 
     version = (packet[0] >> 4) & 0x0F
     ihl = (packet[0] & 0x0F) * 4 # kiểm tra đúng IPv4 và độ dài IP header >= 20 bytes (Slide 4-43)
     if version != 4 or ihl < 20 or len(packet) < ihl + 20:
-        return False
+        return None
 
     total = struct.unpack('!H', packet[2:4])[0]
     if total < ihl + 20 or len(packet) < total: # đảm bảo total length hợp lệ và gói không bị cắt cụt (Slide 4-43)
-        return False
+        return None
 
     if packet[9] != socket.IPPROTO_TCP: # giao thức tầng trên phải là TCP = 6 (Slide 4-43)
-        return False
+        return None
 
     tcp = packet[ihl:total]
     tcp_header_len = ((tcp[12] >> 4) & 0x0F) * 4 # kiểm tra head len của TCP >= 20 và <= len(tcp) (Slide 3-78)
     if tcp_header_len < 20 or len(tcp) < tcp_header_len:
-        return False
+        return None
 
     pseudo = packet[12:16] + packet[16:20] + struct.pack('!BBH', 0, socket.IPPROTO_TCP, len(tcp))
     return checksum(pseudo + tcp) == 0 # kiểm tra tổng kiểm 16-bit bù 1 (Slide 3-31..3-34, 3-44)
@@ -928,8 +922,10 @@ def run_conn_recv(s: socket.socket, session: conn_struct) -> bytes:
                 except queue.Empty:
                     continue
 
-                if not verify_tcp_checksum(packet):
+                checksum_ok = verify_tcp_checksum(packet)
+                if checksum_ok is None:
                     continue
+
                 ihl = (packet[0] & 0x0F) * 4
                 total = struct.unpack('!H', packet[2:4])[0]
                 tcp_packet = packet[ihl:total]
@@ -965,6 +961,11 @@ def run_conn_recv(s: socket.socket, session: conn_struct) -> bytes:
                 fin_flag = (flags & 0x01)
                 rst_flag = (flags & 0x04) >> 2
 
+                if not checksum_ok:
+                    if ack_flag and has_data and not (syn_flag or rst_flag):
+                        send_pure_ack(s, session)
+                    continue
+
                 print(f"[Streap_raw] run_conn_recv: Received packet from {client_ip}:{client_port} (SYN={syn_flag}, ACK={ack_flag}, PSH={psh_flag}, FIN={fin_flag}, RST={rst_flag}, Seq={pkt_seq}, Ack={pkt_ack})")
                 # Handle RST (connection reset)
                 if rst_flag:
@@ -996,52 +997,20 @@ def run_conn_recv(s: socket.socket, session: conn_struct) -> bytes:
                         window=window,
                     )
                     on_ack(session, segment, time.monotonic())
-                
-                
 
-                # Handle data payload (PSH + ACK) or (ACK with data) - Fast path ACK
-                # Some clients may not set PSH flag for small requests
-                
-                
-                if (psh_flag and ack_flag) or (ack_flag and has_data and not syn_flag and not rst_flag):
-                    # Dynamically look up header length to bypass any incoming TCP Options
+                if ack_flag and has_data and not syn_flag:
+                    with session.cv:
+                        if not session.peer_eof and session.state in ("ESTABLISHED", "FIN_WAIT_1", "FIN_WAIT_2") and pkt_seq == session.client_seq and len(app_payload) <= session.get_rwnd():
+                            # slide 79 chapter 3: ACK tiến qua các byte nhận liên tục
+                            session.recv_buffer.extend(app_payload)
+                            session.client_seq = (pkt_seq + len(app_payload)) & M32
+                            session.last_activity = time.time()
+                            session.cv.notify_all()
                     
-                    app_payload = tcp_packet[tcp_header_len:]
-                    
-                    if len(app_payload) > 0:
-                        if session.peer_eof or session.state not in ("ESTABLISHED", "FIN_WAIT_1", "FIN_WAIT_2"):
-                            if not fin_flag:
-                                send_pure_ack(s, session)   # dup ACK mang window hiện tại
-                        else:                            
-                            print(f"[Streap_raw] Received {len(app_payload)} bytes of data from {client_ip}:{client_port}")
-                            print(f"[Streap_raw] Received payload: {app_payload[:100]}...")
-                        
-                        # # Send ACK for received data IMMEDIATELY (fast path)
-                        # next_ack = pkt_seq + len(app_payload)
-                        
-                        # Order check: accept only the segment that starts at the expected byte (client_seq)
-                            kind = classify_segment(session.client_seq, pkt_seq, len(app_payload))
-                            if kind == "partial_overlap":
-                                overlap_bytes = -seq_diff(pkt_seq, session.client_seq) # số byte đầu bị trùng
-                                app_payload = app_payload[overlap_bytes:]
-                                print(f"[Streap_raw] run_conn_recv: partial_overlap seq={pkt_seq}, trimmed {overlap_bytes}B, kept {len(app_payload)}B")
-                            if kind in ("in_order", "partial_overlap"):
-                                # flow control (slide 3-94): từ chối byte không vừa buffer nhận (ACK với ack cũ, window hiện tại)
-                                if len(app_payload) > session.get_rwnd():
-                                    print(f"[Streap_raw] run_conn_recv: no room in receive buffer (rwnd={session.get_rwnd()}), not accepted")
-                                    send_pure_ack(s, session)
-                                else:
-                                    next_ack = (session.client_seq + len(app_payload)) & M32
-                                    with session.cv:   # LƯU TRƯỚC để window quảng bá đã tính các byte vừa nhận (slide 3-94/3-95)
-                                        session.client_seq = next_ack
-                                        session.recv_buffer.extend(app_payload)
-                                        session.last_activity = time.time()
-                                        session.cv.notify_all()
-                                    window = send_pure_ack(s, session)
-                                    print(f"[Streap_raw] Sent ACK for data (Ack={next_ack}, window={window})")
-                            else:
-                                print(f"[Streap_raw] run_conn_recv: {kind} seq={pkt_seq}, expected={session.client_seq} -> dup ACK")
-                                send_pure_ack(s, session)   # dup ACK mang window hiện tại
+                    # FIN kèm DATA được nhánh FIN bên dưới kiểm tra và phản hồi
+                    if not fin_flag:
+                        send_pure_ack(s, session)
+
                 # Handle FIN (connection close)
                 if fin_flag:
                     fin_seq = (pkt_seq + len(tcp_packet[tcp_header_len:])) & M32
@@ -1085,13 +1054,23 @@ def run_conn_recv(s: socket.socket, session: conn_struct) -> bytes:
             return b""
     try:
         with session.cv:
-            while len(session.recv_buffer) == 0 and not session.peer_eof and session.error is None and session.state != "CLOSED":
+            while not session.recv_buffer and not session.peer_eof and session.error is None and session.state != "CLOSED":
                 session.cv.wait(timeout=0.5)
-            if len(session.recv_buffer) > 0:
-                data = bytes(session.recv_buffer)
-                session.recv_buffer.clear()
-                return data
-            return b""
+            if not session.recv_buffer:
+                return b""
+
+            # slide 94, 95 chapter 3: ứng dụng đọc dữ liệu, giải phóng chỗ trong buffer nhận
+            old_rwnd = session.get_rwnd()
+            data = bytes(session.recv_buffer)
+            session.recv_buffer.clear()
+            window_reopened = old_rwnd == 0 and session.get_rwnd() > 0
+
+        if window_reopened:
+            try:
+                send_pure_ack(s, session)
+            except OSError as e:
+                print(f"[Streap_raw] Failed to send window update: {e}")
+        return data
 
     except KeyboardInterrupt:
         print("\n[Streap_raw] Receive loop interrupted.")
@@ -1148,7 +1127,6 @@ def wait_for_ack(s, conn_info, start, target, unacked, rtt, ack_seq, need=None):
             conn_info.server_port, conn_info.client_port,
             seq=seg_seq, ack_seq=conn_info.client_seq, payload=seg_chunk, window=conn_info.get_rwnd()
         )
-        record.last_sent_at = sent_at   # slide 81 chapter 3: record retransmit sẽ bị loại khỏi phép lấy mẫu RTT
         record.retransmitted = True
         conn_info.last_activity = time.time()
         conn_info.timer_deadline = sent_at + rtt.rto # slide 84, 146 chapter 3
@@ -1330,7 +1308,7 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                         seq=segment_seq, ack_seq=session.client_seq, payload=chunk, window=session.get_rwnd()
                     )
 
-                    session.unacked.append(OutstandingSegment(seq=segment_seq, payload=chunk, first_sent_at=sent_at, last_sent_at=sent_at)) # slide 79, 146 chapter 3: giữ dữ liệu chưa ACK để có thể gửi lại
+                    session.unacked.append(OutstandingSegment(seq=segment_seq, payload=chunk, first_sent_at=sent_at)) # slide 79, 146 chapter 3: giữ dữ liệu chưa ACK để có thể gửi lại
                     session.server_seq = (segment_seq + len(chunk)) & M32    # slide 146 chapter 3: NextSeqNum = NextSeqNum + length(data)
                     session.last_activity = time.time()
                     if session.timer_deadline is None:
